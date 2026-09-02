@@ -1,0 +1,70 @@
+<html>
+<body>
+<pre>
+<h1>µVision Build Log</h1>
+<h2>Tool Versions:</h2>
+IDE-Version: ¦ÌVision V5.43.1.0
+Copyright (C) 2025 ARM Ltd and ARM Germany GmbH. All rights reserved.
+License Information: Dai Y, A, LIC=CZLZX-HTEXW-FWI2N-Y1IM2-96MJI-C4Q5Q
+ 
+Tool Versions:
+Toolchain:       MDK-ARM Plus  Version: 5.43.0.0
+Toolchain Path:  C:\Users\dyx10\AppData\Local\Keil_v5\ARM\ARMCLANG\Bin
+C Compiler:      ArmClang.exe V6.24
+Assembler:       Armasm.exe V6.24
+Linker/Locator:  ArmLink.exe V6.24
+Library Manager: ArmAr.exe V6.24
+Hex Converter:   FromElf.exe V6.24
+CPU DLL:         SARMCM3.DLL V5.43.0.0
+Dialog DLL:      DCM.DLL V1.17.5.0
+Target DLL:      STLink\ST-LINKIII-KEIL_SWO.dll V3.3.1.0
+Dialog DLL:      TCM.DLL V1.56.6.0
+ 
+<h2>Project:</h2>
+D:\000STM32H750SDR\TX\MDK-ARM\000STM32H750SDR.uvprojx
+Project File Date:  09/01/2026
+
+<h2>Output:</h2>
+*** Using Compiler 'V6.24', folder: 'C:\Users\dyx10\AppData\Local\Keil_v5\ARM\ARMCLANG\Bin'
+Build target '000STM32H750SDR'
+../Core/Src/main.c(523): warning: unknown attribute 'optimize' ignored [-Wunknown-attributes]
+  523 | __attribute__((optimize("O2"), hot))
+      |                ^~~~~~~~~~~~~~
+../Core/Src/main.c(717): warning: 'snprintf' will always be truncated; specified size is 110, but format string expands to at least 125 [-Wformat-truncation]
+  717 |         n = snprintf(buf, sizeof buf,
+      |             ^
+../Core/Src/main.c(826): warning: unknown attribute 'optimize' ignored [-Wunknown-attributes]
+  826 | __attribute__((optimize("O2"), hot))
+      |                ^~~~~~~~~~~~~~
+3 warnings generated.
+compiling main.c...
+linking...
+Program Size: Code=44374 RO-data=2230 RW-data=26800 ZI-data=6840  
+FromELF: creating hex file...
+"000STM32H750SDR\000STM32H750SDR.axf" - 0 Error(s), 3 Warning(s).
+
+<h2>Software Packages used:</h2>
+
+Package Vendor: ARM
+                https://www.keil.com/pack/ARM.CMSIS.6.2.0.pack
+                ARM::CMSIS@6.2.0
+                CMSIS (Common Microcontroller Software Interface Standard)
+   * Component: CORE Version: 6.1.1
+
+Package Vendor: Keil
+                https://www.keil.com/pack/Keil.STM32H7xx_DFP.4.1.1.pack
+                Keil::STM32H7xx_DFP@4.1.1
+                STMicroelectronics STM32H7 Series Device Support
+
+<h2>Collection of Component include folders:</h2>
+  ./RTE/_000STM32H750SDR
+  C:/Users/dyx10/AppData/Local/Arm/Packs/ARM/CMSIS/6.2.0/CMSIS/Core/Include
+
+<h2>Collection of Component Files used:</h2>
+
+   * Component: ARM::CMSIS:CORE@6.1.1
+      Include file:  CMSIS/Core/Include/tz_context.h
+Build Time Elapsed:  00:00:02
+</pre>
+</body>
+</html>
