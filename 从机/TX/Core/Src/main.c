@@ -1,0 +1,2476 @@
+/* ============================================================
+ * v70 FULL-DUPLEX NOTE:
+ *   PTT only gates TX.  RX ADC1/DMA, demod, PCM5102 and SPI spectrum
+ *   upload remain active continuously.  TIM3 feeds RX at 600kHz,
+ *   TIM4 runs TX audio/baseband at 2.4MHz, and TIM2 only emits the
+ *   2.4MHz carrier/DAC stream.
+ *
+ * v22.1 NOTE: All peripheral configs (clock/GPIO/USART/ADC/DAC/
+ * TIM/SAI...) are hand-written and have drifted from the CubeMX
+ * generated .ioc. Do NOT open/regenerate/sync this project with
+ * CubeMX, it would break the hand-written config. CubeMX files
+ * (.ioc/.mxproject) are obsolete - keep them untouched.
+ * ============================================================ */
+/* main_v5.c - DSB-SC (I/Q) modulator, 465kHz carrier, 2.4MHz sample rate
+ *          4096-point Sin LUT  +  USART2 ??????? (???)
+ *
+ *          PA4 = I-path: band-pass(audio)*cos   PA5 = Q-path: hilbert(audio)*sin
+ *          Matched LP-shift phase splitter (I/Q noise balanced), boxcar-32
+ *          decimation 2.4MHz->75kHz.  RF sideband: LSB.
+ *
+ *  =====================================================================
+ *  v5 ???? (?? ISR ??: ????? ~347kHz):
+ *    v4 ? ISR ???????? 200/?? (480MHz/2.4MHz), ?????
+ *    ?? ~1.79MHz -> ?? 465k ??? ~347k, ?????
+ *    ??? ISR ??? 200 ???? (???? ~174 ??, ?? ~13%),
+ *    ??:
+ *      1) splitter ???? 4 ? (??????/??/??)
+ *      2) dec_buf ?? 3 ????? (768): ??????? [125,510]/
+ *         [0,385] ???????, ??????, 8 ??? LDRSH
+ *      3) ??????? int32 (?????, ?????)
+ *      4) 4 ?????? __SSAT ???? (???)
+ *      5) isr_rx_poll ???? O2, ????? ~5 ??
+ *      6) ????: ISR ???????/??/???? (? vsnprintf,
+ *         ? double ???; PHASE/TONE ??? 64 ???, ??? -> ??),
+ *         ?????????? flush_reply()
+ *      7) ?? DWT ????: INFO ??? MAXISR (?? ISR ???),
+ *         ???????????? (? ~200; ???? MAXISR ???
+ *         ?????, ????)?ISR_TIMING_MEASURE=0 ????
+ *    ??? v4 ??: USART2 ??? TIM2 ISR ?, ???, ??????
+ *  =====================================================================
+ *  v6 ???? (v5 ?? MAXISR ?? 200: ?? 394kHz -> ????? 2.03MHz):
+ *    v5 ?? ISR ~236 ??/?? (????), ?????:
+ *      1) SLICE=4 -> 1: ???? ISR ?? 1 ? MAC (128 ISR/?), ???
+ *         75kHz -> 18.75kHz (?? 0-3k, Nyquist 9.375k ??), ?????????
+ *      2) split_wp ??????????, ?????????
+ *      3) ??/??/??? I/Q ?????? (recompute_gains), ????
+ *         ISR ?? i_audio_dac_run/q_audio_dac_run, ??? ISR ?????
+ *      4) DAC ?????: dac = DC + (dac_run*cos)>>15, ??? ISR ? *AMP>>15
+ *      5) 4 ? DAC ????? __USAT(,12) ???
+ *      6) ????? MODE=1 ????, ????
+ *    ??? v5 ?????MAXISR ????? ~160-190?
+ *  =====================================================================
+ *  v8 ???? (?????? Flash ??):
+ *    1) ????????????????? (LSB/USB), ????????,
+ *       ??? LSB ?????SIDE ?? (0=LSB 1=USB) ???:
+ *         - ?? Q ???? (I�cos+Q�sin=LSB; I�cos-Q�sin=USB)
+ *         - ??????????? (IGAIN/PHASE/QUAD/IDC/QDC/AGAIN)
+ *       ????????????????? (????, ?????)?
+ *       ??????????????? CFG_LSB_DEFAULT / CFG_USB_DEFAULT?
+ *    2) ?? v7 ? Flash ????? (???????? Bank ??????,
+ *       ?????????)?????????
+ *    3) STREAM ????????? I/Q ????? (? 128 ISR ??,
+ *       ?? 18.75kHz, ?????), stream_decim ???? (?? 1)?
+ *    ??: SIDE <0|1> ???????????; STAT ?? SIDE= ???
+ *  =====================================================================
+ *  v10 ?????? (????):
+ *    1) MODE ??: 6=CW 7=NFM 8=AM (???, DAC1=DAC2 ????????)
+ *       - CW : ????, ???? TX ??? PC13 ??????
+ *       - NFM: ?25kHz ??, ?? 6kHz ?????????
+ *       - AM : ?6kHz ??, 100% ????, ????
+ *    2) 6kHz 2?IIR?? (Q14??, 75kHz ?? 32 ISR ??) ? NFM/AM ?
+ *    3) ???????: nfm_inc_run/am_env_run ? 75kHz ??????,
+ *       ???? ISR ??, ?????
+ *    4) PC13 ?? (??, ?????) ?? CW ??
+ *    ??: TX <0|1> ?? CW ??; STAT ?? TX=; MODE 0-8?
+ *  =====================================================================
+ * v20 ????: RX/TX ????????
+ *    RX 1: ???????? (DAC ??, ???? DSP), ADC1 ????,
+ *          ???? 1.2MHz, ?? 2048 ??? AA 5A, ???????+??
+ *    RX 0: ????, tx_dsp_reset ?????? DSP
+ *    ?????????, ????????????
+ *  =====================================================================
+ */
+
+#include "main.h"
+#include "stm32h7xx_hal.h"
+#include "stm32h7xx_hal_tim.h"
+#include "stm32h7xx_hal_dac.h"
+#include "stm32h7xx_hal_adc.h"
+#include "stm32h7xx_hal_uart.h"
+#include "stm32h7xx_hal_dma.h"
+#include "pcm5102.h"
+#include "am_demod.h"
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+
+#ifndef M_PI
+#define M_PI 3.141592653589793f
+#endif
+
+/* ========== Handlers ========== */
+static DAC_HandleTypeDef hdac1;
+static TIM_HandleTypeDef htim2;
+static TIM_HandleTypeDef htim3;
+static TIM_HandleTypeDef htim4;
+static ADC_HandleTypeDef hadc3;
+static ADC_HandleTypeDef hadc1;
+static UART_HandleTypeDef huart2;
+static DMA_HandleTypeDef hdma_usart2_tx;              /* v23: USART2 TX DMA */
+static volatile uint8_t uart_dma_busy = 0;            /* v23: DMA in progress */
+static SPI_HandleTypeDef hspi3;  /* v24: SPI3 slave (frame upload to display MCU) */
+
+#define LED_PIN      GPIO_PIN_1
+#define LED_PORT     GPIOC
+#define LED_TOGGLE   HAL_GPIO_TogglePin(LED_PORT, LED_PIN)
+
+/* v70: compact health bits carried in frame byte 2. */
+#define HEALTH_TIM2   0x01U
+#define HEALTH_TIM3   0x02U
+#define HEALTH_TIM4   0x04U
+#define HEALTH_MAIN   0x08U
+#define HEALTH_CHAIN  0x10U
+#define HEALTH_PCM    0x20U
+#define HEALTH_CLIP   0x40U   /* v71: ADC input hit the rails - front-end overload */
+#define HEALTH_DISTORT 0x80U  /* v71: input already peak-compressed before the ADC */
+
+/* ========== Config ========== */
+#define CARRIER_FREQ       465000.0f
+#define DC_OFFSET          2048
+#define AMPLITUDE          2000        /* DAC ?? */
+
+#define I_PATH_GAIN        32767       /* I ????? (Q15) */
+#define Q_PATH_GAIN        32767
+
+#define SAMPLE_RATE        2400000.0f
+#define AUDIO_GAIN         64
+#define MUTE_THRESHOLD     0
+#define USART2_BAUDRATE    921600      /* ?????????? */
+
+/* ===== ISR ???? (DWT ????) =====
+ * 1: ??"??????"?????, INFO ??? MAXISR?
+ *    2.4MHz@480MHz -> ?? ~200; ??? 200 ?? ISR ???
+ * ??????? 0 ??????? */
+#define ISR_TIMING_MEASURE   0
+#define _DWT_CYCCNT   (*(volatile uint32_t *)0xE0001004UL)
+#define _DWT_CTRL     (*(volatile uint32_t *)0xE0001000UL)
+#define _DEMCR        (*(volatile uint32_t *)0xE000EDFCUL)
+static volatile uint32_t g_prev_isr = 0;
+static volatile uint8_t  g_prev_isr_ok = 0;
+static volatile uint32_t g_max_isr_cyc = 0;
+static volatile uint32_t hb_tim2 = 0, hb_tim3 = 0, hb_tim4 = 0, hb_main = 0;
+static volatile uint8_t  wd_healthy = 0;
+static volatile uint32_t adc_clip_cnt = 0;   /* v71: ADC rail hits since last frame */
+static volatile uint8_t  crest_ok = 1;       /* v71: input not peak-compressed */
+
+#define IWDG_KEY_RELOAD  0x0000AAAAUL
+#define IWDG_KEY_ENABLE  0x0000CCCCUL
+#define IWDG_KEY_UNLOCK  0x00005555UL
+
+static inline void watchdog_pet(void)
+{
+    if (wd_healthy) IWDG1->KR = IWDG_KEY_RELOAD;
+}
+
+/* Bounded demod drain: never let a producer/consumer rate mismatch
+ * monopolize the main loop (observed as SSB RX + WD:3F freeze). */
+static inline void drain_demod_burst(void)
+{
+    for (uint32_t n = 0; n < 64U; n++) {
+        if (!am_demod_poll()) break;
+        if ((n & 15U) == 0U) watchdog_pet();
+    }
+}
+
+static void watchdog_start(void)
+{
+    uint32_t t0;
+
+    /* Follow the proven HAL sequence: enabling IWDG also forces LSI on. */
+    IWDG1->KR = IWDG_KEY_ENABLE;
+    IWDG1->KR = IWDG_KEY_UNLOCK;
+    IWDG1->PR = 3U;              /* LSI / 32 ~= 1kHz */
+    IWDG1->RLR = 8000U;          /* ~8s */
+
+    t0 = HAL_GetTick();
+    while ((IWDG1->SR & (IWDG_SR_PVU | IWDG_SR_RVU)) != 0U) {
+        if ((HAL_GetTick() - t0) > 20U) break;
+    }
+    IWDG1->KR = IWDG_KEY_RELOAD;
+}
+#define LUT_SIZE           4096
+#define LUT_MASK           (LUT_SIZE - 1)
+#define STARTUP_DURATION   1.0f
+#define STARTUP_COUNT      ((uint32_t)(SAMPLE_RATE * STARTUP_DURATION))
+#define CARRIER_PHASE_INC  832149914U
+
+/* ========== ?? + ?????? ========== */
+#define DEC_FACTOR         32
+#define DEC_TAPS           128
+#define DEC_HALF           (DEC_TAPS / 2)
+#define DEC_MASK           (DEC_TAPS - 1)
+#define SLICE              1   /* v6: ? ISR 1 ? MAC, ?? 128 ISR -> 18.75kHz I/Q ?? (?? 0-3k ??) */
+#define SPLIT_FS           75000.0f
+#define SPLIT_F0           1650.0f
+#define SPLIT_FCLP         1350.0f
+
+/* ========== ??????? (DTCMRAM) ========== */
+static int16_t g_q15[DEC_HALF]       ;
+static int16_t h_q15[DEC_HALF]       ;
+/* dec_buf: 3 ????? (768) �� ??? 0..255 ????? +256/+512,
+ * ???????? [125,510] ? [0,385] ????????????/???
+ * ??????????? 3 ?????? */
+static int16_t dec_buf[3 * DEC_TAPS] ;
+static int32_t boxcar_buf[DEC_FACTOR] ;
+static uint8_t  boxcar_idx = 0;
+static int32_t  boxcar_sum = 0;
+static uint16_t dec_wp = 0;
+static uint16_t pair_idx = 0;
+static uint16_t split_wp = 0;          /* v6: ???????????? */
+#define SSB_TAPS_PER_TICK (DEC_HALF / 4U)
+static uint16_t split_tap = 0;          /* v70: distributed 128-tap SSB FIR */
+static int16_t ssb_win_hi[DEC_HALF];
+static int16_t ssb_win_lo[DEC_HALF];
+static int64_t  i_acc = 0, q_acc = 0;
+static int16_t  i_audio_cur = 0;
+static int16_t  q_audio_cur = 0;
+/* v6: ??/??/??? I/Q ??????, ???? ISR ??? (??? ISR ????) */
+static volatile int32_t i_audio_g_run = 0;
+static volatile int32_t q_audio_g_run = 0;
+static volatile int32_t i_audio_dac_run = 0;
+static volatile int32_t q_audio_dac_run = 0;
+static uint8_t   side_run = 0;            /* 0=LSB 1=USB */
+
+/* ========== v8: LSB/USB ????? (????, ?????????) ==========
+ * ??????????? I/Q ???? (QUAD/PHASE/IGAIN ??)?
+ * SIDE=0(LSB) ? CFG_LSB_DEFAULT; SIDE=1(USB) ? CFG_USB_DEFAULT?
+ * PHASE ??: 0.001?, ?? 14700 = 14.700??QUAD: Q15?
+ * ???? cfg_lsb/cfg_usb ?????? (???????, ???????),
+ * ???????????; ??????????????? */
+typedef struct {
+    int32_t  igain;
+    int32_t  qgain;
+    uint32_t phase_off32;
+    int16_t  quad;
+    int16_t  idc;
+    int16_t  qdc;
+    uint32_t again;
+} iq_cfg_t;
+
+#define PHASE_TO_OFF32(d)  ((uint32_t)(((uint64_t)(d) << 32) / 360000ULL))
+
+/* SSB CONFIG */
+static const iq_cfg_t CFG_LSB_DEFAULT = {
+    33554, 32833, PHASE_TO_OFF32(13000), -7668, 0, 0, 100 };
+static const iq_cfg_t CFG_USB_DEFAULT = {
+    33357, 32767, PHASE_TO_OFF32(10440), 6094, 0, 0, 64 };
+
+static iq_cfg_t cfg_lsb;   /* ??? LSB ?? (??=??, ??????) */
+static iq_cfg_t cfg_usb;   /* ??? USB ?? */
+static uint32_t dc_q16 = (2048U << 16);
+static uint32_t dec_sample_cnt = 0;
+
+/* ========== ?? ========== */
+static int16_t sin_table_q15[LUT_SIZE] ;
+static int16_t cos_table_q15[LUT_SIZE] ;
+static float trigger_freq = 0.0f;
+static volatile uint32_t carrier_phase = 0;
+volatile uint32_t sys_tick = 0;
+volatile uint32_t int_count = 0;
+static volatile uint8_t modulation_enabled = 0;
+
+volatile int32_t  debug_ac_i = 0;
+volatile int16_t  debug_audio_q15 = 0;
+volatile int16_t  debug_i_audio = 0;
+volatile int16_t  debug_q_audio = 0;
+
+/* ========================================================================
+ * USART2 ???? (????????, ISR ?????)
+ * ======================================================================== */
+volatile int32_t  i_gain_run   = I_PATH_GAIN;
+volatile int32_t  q_gain_run   = Q_PATH_GAIN;
+volatile uint32_t phase_off32  = 0;
+volatile int16_t  quad_q15     = 0;
+volatile int16_t  idc_trim     = 0;
+volatile int16_t  qdc_trim     = 0;
+volatile int32_t  audio_gain_run = AUDIO_GAIN;
+volatile uint8_t  mode_run     = 8;  /* default TX mode = AM, matches host UI */
+volatile uint8_t  ptt_cmd      = 0;  /* v69: continuous TX enable, separate from CW key */
+volatile uint16_t tone_freq    = 1000;
+volatile uint8_t  stream_en    = 0;
+volatile uint16_t stream_decim = 1;
+volatile uint32_t tuned_freq_hz = 465000UL;
+
+static volatile uint32_t tone_phase = 0;
+static uint32_t tone_inc   = 0;
+static uint32_t stream_cnt = 0;
+
+/* ========== v10: ????? (CW/NFM/AM) ========== */
+/* NFM ??: ?25kHz ??????? = 25000/2.4M*2^32 = 44739242?
+ * ? int32 ?? y*1365 (= y*44739242>>15), ?? -0.024% (25k ? 6Hz) */
+#define NFM_DEV_Q15_APPROX  1365
+#define AM_CARRIER     1000         /* AM ???? (DAC ?, 100% ?? env 0..2000) */
+/* 4? Butterworth 6kHz LPF (fs=75kHz), ?? biquad ?? Q14, int32 ???
+ * ?? v10 ? 2 ? (12dB/oct), 4 ? 24dB/oct ? FM ????????:
+ *   12kHz: 2?-13.4dB -> 4?-26.4dB; 18kHz: -22.6 -> -45.1dB
+ * v12: int64->int32 (?0??49.7M ?1??173.5M << 2^31),
+ *      ?? 128 ?? ISR ??, ?? STREAM ????????? */
+#define LP1_B0 37      /* ?0 Q14 */
+#define LP1_B1 73
+#define LP1_B2 37
+#define LP1_A1 19871
+#define LP1_A2 -6292
+#define LP2_B0 16384   /* ?1 Q14 (????? 1.0) */
+#define LP2_B1 32768
+#define LP2_B2 16384
+#define LP2_A1 24245
+#define LP2_A2 -11283
+volatile uint8_t  tx_cmd  = 0;      /* ??? TX ?? */
+volatile uint8_t  tx_pc13 = 0;      /* PC13 ?? (1=??) */
+volatile uint8_t  tx_sw   = 0;      /* CW ?????? (? PC13) */
+static int32_t  l1_x1=0, l1_x2=0, l1_y1=0, l1_y2=0;   /* biquad ?0 */
+static int32_t  l2_x1=0, l2_x2=0, l2_y1=0, l2_y2=0;   /* biquad ?1 */
+static volatile uint32_t nfm_inc_run = CARRIER_PHASE_INC;
+static volatile int32_t  am_env_run  = AM_CARRIER;
+static volatile int32_t  lpf_audio_run = 0;   /* 6k ????? (NFM/AM ?????) */
+
+/* ??????? */
+#define STREAM_BUF   2048
+#define STREAM_MASK  (STREAM_BUF - 1)
+#define STREAM_PKT   32
+static int16_t stream_buf[STREAM_BUF] ;
+static volatile uint16_t stream_wp = 0;
+static uint16_t stream_rp = 0;
+
+/* v71: tx_dsp_reset() clears ~5.5KB of DSP history.  Running it with
+ * interrupts globally masked (as the old call sites did) blocked the PCM5102
+ * I2S half-transfer callback and the TIM3 RX feed for ~11us, which is the
+ * small audio/spectrum hiccup heard at every PTT edge.  Request it instead
+ * and let the TIM4 handler - the owner of the TX DSP state - do the work,
+ * where TIM2/TIM3 can still preempt it. */
+static volatile uint8_t tx_dsp_reset_req = 0;
+static uint8_t  stream_seq = 0;
+/* ========== v20: RX/TX ???? + ?????? ==========
+ * RX 1: ???????? (DAC ??, ???? DSP),
+ *       ADC1(IN3??) ????, ???? 1.2MHz,
+ *       ??? RX_FRAME_N=2048 ? (1.7ms ?) ?? AA 5A ?,
+ *       ????????? + ?? (465k?100k)
+ * RX 0: ????, ?????? DSP ?? (tx_dsp_reset)
+ * ????????? -> ????, ??????????? */
+#define RX_FRAME_N   4096   /* v60: 2048->4096 —— 主机 FFT 同升, 频率分辨率 1832->916 Hz/bin */
+#define TEST_SINE    0              /* 1=CPU理想正弦覆盖(对照实验: 区分采集侧vs传输侧) 0=真实ADC(v31.32) */
+#define TEST_SINE_F0 200000.0f      /* 测试正弦频率: 200k=与真实信号同频(非整数bin, 对照泄漏) */
+static int16_t rx_buf[RX_FRAME_N] ;
+static volatile uint8_t  rx_mode = 1;      /* 0=TX 1=RX (v24: default RX for spectrum testing) */
+static volatile uint8_t  rx_chain_en = 1;  /* v69: RX DSP/ADC/PCM can stay on during TX */
+static volatile uint8_t  full_duplex_en = 0;
+static volatile uint32_t rx_wp = 0;
+static volatile uint8_t  rx_ready = 0;     /* ???? */
+static volatile uint8_t  rx_acquire = 1;   /* ???? */
+static volatile uint8_t  rx_div = 0;       /* ?????? */
+static int16_t slow_buf[16];            /* v31.34-DIAG: 慢速采样对照(6.8ms/点) */
+static volatile uint8_t  slow_wp = 0;
+static volatile uint8_t  slow_ready = 0;
+static uint8_t  rx_seq = 0;
+static uint8_t  rx_tx_active = 0;          /* ?????? */
+/* v31.40b: adc_dma_buf 必须放 AXI SRAM(0x24000000) —— H750 DMA1 无法访问
+ * DTCM(0x20000000), static 默认落 DTCM 导致 DMA 写入静默失败(缓冲全 0)。
+ * .ARM.__at_ = Keil AC6 绝对放置; RW_IRAM2 区已在 .sct(0x24000000, 512KB)。 */
+__attribute__((section(".ARM.__at_0x24000000")))
+static volatile uint16_t adc_dma_buf[RX_FRAME_N]; /* v31.40-DMA: ADC1 DMA 连续采集判别缓冲 */
+/* v57-DBM: 双缓冲 B 放 0x24002000(v60: A 后 8KB, RX_FRAME_N=4096 时 A 占 8KB,
+ * 原 0x24001000 会与 A 重叠 4KB)。DMA M0AR<->M1AR 硬件乒乓自动切换,
+ * 主循环拷"非当前写缓冲"(CT 位指示) -> memcpy 源=DMA 已写完一整圈的缓冲,
+ * 与 DMA 写零竞争, 消除"拷贝撕裂 -> 帧内相位跳变 -> FFT 泄漏"的从机根因。 */
+__attribute__((section(".ARM.__at_0x24002000")))
+static volatile uint16_t adc_dma_buf2[RX_FRAME_N];
+static volatile uint8_t adc_db_ready = 0;        /* v57: DBM 首圈(M0AR)写完标志, 防首帧拷到未写缓冲 */
+static uint8_t  rx_hdr[5];                            /* v25: SPI frame header */
+static uint8_t  tx_frame[2u * (5 + 2u*RX_FRAME_N)];  /* v60: 双帧缓冲(每会话回传 2 帧 16402B): 帧1+帧2 连续 */
+
+/* ========== Prototypes ========== */
+static void init_sin_table(void);
+static void init_iq_splitter(void);
+static void MX_USART2_UART_Init(void);
+static void uart2_dma_tc_cb(DMA_HandleTypeDef *hdma); /* v23fix: own TC callback (HAL weak symbol not declared in headers) */
+static void MX_DAC1_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_TIM4_Init(void);
+static void MX_ADC3_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_GPIO_Init(void);
+static void uart2_puts(const char *s);
+static void uart2_tx(const uint8_t *buf, uint16_t len);
+static uint8_t uart2_tx_dma(const uint8_t *buf, uint16_t len);  /* v23 */
+static void isr_rx_poll(void);       /* ? TIM2 ISR ??? */
+static void isr_parse(char *line);
+static void flush_reply(void);       /* ???: ?? ISR ????? */
+static void recompute_gains(void);
+static void tx_dsp_reset(void);   /* v20 */
+static void rx_chain_start(void);
+static void rx_chain_stop(void);
+static void apply_cfg(const iq_cfg_t *c);
+static iq_cfg_t *cur_cfg(void);
+
+#ifndef __SSAT
+static inline int32_t __SSAT(int32_t x, uint32_t sat);   /* ???? (???) */
+#endif
+#ifndef __USAT
+static inline uint32_t __USAT(int32_t x, uint32_t sat);   /* ???? (???) */
+#endif
+
+/* ---- v8: ???????????????? ----
+ * (???? i_gain_run ?, ????????) */
+static void apply_cfg(const iq_cfg_t *c)
+{
+    i_gain_run     = c->igain;
+    q_gain_run     = c->qgain;
+    phase_off32    = c->phase_off32;
+    quad_q15       = c->quad;
+    idc_trim       = c->idc;
+    qdc_trim       = c->qdc;
+    audio_gain_run = c->again;
+    recompute_gains();
+}
+
+/* ---- v8: ?????????? (???????) ---- */
+static iq_cfg_t *cur_cfg(void)
+{
+    return side_run ? &cfg_usb : &cfg_lsb;
+}
+
+/* ---- v6: I/Q ????????, ?????????? ----
+ * ???? ISR ??????; ???????? ISR ???
+ * v7: USB ?? Q ?? dac ?? (I�cos+Q�sin=LSB; I�cos-Q�sin=USB)? */
+static void recompute_gains(void)
+{
+    int32_t is, qs;
+    switch (mode_run)
+    {
+        case 0:
+        case 4:  is = i_audio_cur; qs = q_audio_cur; break; /* 4=??: tone ?????? */
+        case 2:  is = i_audio_cur; qs = 0;           break;
+        case 3:  is = 0;           qs = q_audio_cur; break;
+        default: is = 0;           qs = 0;           break;
+    }
+    i_audio_g_run = ((int32_t)__SSAT(is + idc_trim, 16) * i_gain_run) >> 15;
+    q_audio_g_run = ((int32_t)__SSAT(qs + qdc_trim + (((int32_t)quad_q15 * is) >> 15), 16) * q_gain_run) >> 15;
+    i_audio_dac_run = (i_audio_g_run * AMPLITUDE) >> 15;
+    q_audio_dac_run = (q_audio_g_run * AMPLITUDE) >> 15;
+    if (side_run) q_audio_dac_run = -q_audio_dac_run;   /* USB ?? Q ?? */
+}
+static void drain_stream(void);
+void SystemClock_Config(void);
+void PeriphCommonClock_Config(void);
+static void MPU_Config_Audio(void);
+static void audio_dac_init_once(void);
+static uint8_t s_audio_dac_inited = 0;
+void Error_Handler(void);
+
+/* ========== Sin/Cos LUT (Q15) ========== */
+static void init_sin_table(void)
+{
+    for (int i = 0; i < LUT_SIZE; i++) {
+        sin_table_q15[i] = (int16_t)(sinf(2.0f * M_PI * i / LUT_SIZE) * 32767.0f);
+        cos_table_q15[i] = (int16_t)(cosf(2.0f * M_PI * i / LUT_SIZE) * 32767.0f);
+    }
+}
+
+/* ========== ???????? ========== */
+static void init_iq_splitter(void)
+{
+    const double fs   = SPLIT_FS;
+    const double f0   = SPLIT_F0;
+    const double fclp = SPLIT_FCLP;
+    const int    N    = DEC_TAPS;
+    const double mid  = (double)(N - 1) / 2.0;
+    const double wc   = 2.0 * M_PI * fclp / fs;
+    const double th0  = 2.0 * M_PI * f0 / fs;
+    static double gd[DEC_TAPS], hd[DEC_TAPS];
+
+    for (int n = 0; n < N; n++)
+    {
+        double x = (double)n - mid;
+        double win = 0.54 - 0.46 * cos(2.0 * M_PI * n / (N - 1));
+        double sinc = (fabs(x) < 1e-12) ? (wc / M_PI) : (sin(wc * x) / (M_PI * x));
+        double pn = sinc * win;
+        gd[n] = 2.0 * pn * cos(th0 * x);
+        hd[n] = 2.0 * pn * sin(th0 * x);
+    }
+
+    double Gr = 0.0, Gi = 0.0;
+    for (int n = 0; n < N; n++)
+    {
+        double x = (double)n - mid;
+        double ph = -2.0 * M_PI * f0 * x / fs;
+        Gr += gd[n] * cos(ph);
+        Gi += gd[n] * sin(ph);
+    }
+    double G0 = sqrt(Gr * Gr + Gi * Gi);
+    double scale = (G0 > 1e-12) ? (1.0 / G0) : 1.0;
+
+    for (int n = 0; n < DEC_HALF; n++)
+    {
+        double cg = gd[n] * scale;
+        double ch = hd[n] * scale;
+        if (cg >  1.0) cg =  1.0;
+        if (cg < -1.0) cg = -1.0;
+        if (ch >  1.0) ch =  1.0;
+        if (ch < -1.0) ch = -1.0;
+        g_q15[n] = (int16_t)(cg * 32767.0);
+        h_q15[n] = (int16_t)(ch * 32767.0);
+    }
+
+    memset(dec_buf, 0, sizeof(dec_buf));
+    memset(boxcar_buf, 0, sizeof(boxcar_buf));
+    boxcar_sum = 0; boxcar_idx = 0;
+    dec_wp = 0; pair_idx = 0; split_wp = 0;
+    i_acc = 0; q_acc = 0;
+    i_audio_cur = 0; q_audio_cur = 0;
+    i_audio_g_run = 0; q_audio_g_run = 0;
+    i_audio_dac_run = 0; q_audio_dac_run = 0;
+    dec_sample_cnt = 0;
+    memset(stream_buf, 0, sizeof(stream_buf));
+    stream_wp = 0; stream_rp = 0; stream_seq = 0;
+    tone_phase = 0;
+    tone_inc = (uint32_t)((double)tone_freq / (double)SPLIT_FS * 4294967296.0);
+}
+
+/* ========================================================================
+ * USART2 (????, ?????)
+ * ======================================================================== */
+static void MX_USART2_UART_Init(void)
+{
+    __HAL_RCC_USART2_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = GPIO_PIN_2 | GPIO_PIN_3;   /* USART2_TX=PA2, USART2_RX=PA3 */
+    g.Mode = GPIO_MODE_AF_PP;
+    g.Pull = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_HIGH;
+    g.Alternate = GPIO_AF7_USART2;
+    HAL_GPIO_Init(GPIOA, &g);
+
+    huart2.Instance = USART2;
+    huart2.Init.BaudRate = USART2_BAUDRATE;
+    huart2.Init.WordLength = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits = UART_STOPBITS_1;
+    huart2.Init.Parity = UART_PARITY_NONE;
+    huart2.Init.Mode = UART_MODE_TX_RX;
+    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+    huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+    if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler();
+
+    /* ???: ???? USART2 ??, ?? CubeMX ?? IRQHandler ?? */
+    HAL_NVIC_DisableIRQ(USART2_IRQn);
+
+    /* v23: USART2 TX DMA (non-blocking spectrum frame upload).
+       DMA1_Stream6 + DMAMUX request USART2_TX, normal mode.
+       Keeps main loop free while 4096-byte frames are shifted out. */
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    hdma_usart2_tx.Instance = DMA1_Stream6;
+    hdma_usart2_tx.Init.Request = DMA_REQUEST_USART2_TX;
+    hdma_usart2_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_usart2_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_usart2_tx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_usart2_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart2_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_usart2_tx.Init.Mode = DMA_NORMAL;
+    hdma_usart2_tx.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_usart2_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_usart2_tx) != HAL_OK) Error_Handler();
+    __HAL_LINKDMA(&huart2, hdmatx, hdma_usart2_tx);
+    HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 3, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
+    /* v23fix: HAL_DMA_Start_IT() does NOT install the completion callback;
+       HAL_DMA_IRQHandler() only calls XferCpltCallback when it is non-NULL.
+       Without this assignment uart_dma_busy stayed set forever: the DMA sent
+       the first chunk and then stalled (no spectrum frames on the wire). */
+    hdma_usart2_tx.XferCpltCallback = uart2_dma_tc_cb;
+}
+
+/* ---- ??????? (TXE ????, ??? HAL ???) ---- */
+static void uart2_tx(const uint8_t *buf, uint16_t len)
+{
+    uint32_t dg = 1000000;
+    while (uart_dma_busy && --dg) {}      /* v23: wait for DMA TX to finish */
+    for (uint16_t i = 0; i < len; i++)
+    {
+        uint32_t guard = 200000;
+        while (!(USART2->ISR & USART_ISR_TXE_TXFNF) && --guard) {}
+        USART2->TDR = buf[i];
+    }
+}
+
+/* ---- v23: non-blocking USART2 TX via DMA1_Stream6 ----
+ * Submits one buffer to the DMA engine and returns immediately.
+ * Returns 0 when the previous DMA transfer is still running.
+ * The caller must keep *buf alive until uart2_dma_tc_cb clears
+ * uart_dma_busy (DCache cleaned before start, buffer must stay valid). */
+static uint8_t uart2_tx_dma(const uint8_t *buf, uint16_t len)
+{
+    if (hdma_usart2_tx.State != HAL_DMA_STATE_READY) return 0; /* v23fix: poll HW state */
+    SCB_CleanDCache_by_Addr((uint32_t *)buf, (int32_t)len);
+    USART2->CR3 |= USART_CR3_DMAT;
+    if (HAL_DMA_Start_IT(&hdma_usart2_tx,
+                         (uint32_t)buf, (uint32_t)&USART2->TDR, len) != HAL_OK)
+        return 0;
+    uart_dma_busy = 1;
+    return 1;
+}
+
+void DMA1_Stream6_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&hdma_usart2_tx);
+}
+
+static void uart2_dma_tc_cb(DMA_HandleTypeDef *hdma)
+{
+    if (hdma->Instance == DMA1_Stream6) uart_dma_busy = 0;
+}
+
+static void uart2_puts(const char *s)
+{
+    uart2_tx((const uint8_t*)s, (uint16_t)strlen(s));
+}
+
+static void uart2_printf(const char *fmt, ...)
+{
+    /* v31.24: 串口 TX 彻底禁用 —— 用户实测确认串口发送瞬间 MISO 电平反转
+     * (打印阻塞扰动武装相位 -> 采样错位 0x55<->0xAA)。函数体置空: 所有调用
+     * 保留但零输出零阻塞, 串口不再占到任何循环。 */
+    (void)fmt;
+}
+
+/* ========================================================================
+ * USART2 RX: ? TIM2 ISR ??? (?????????)
+ * ======================================================================== */
+#define RX_LINE_MAX 48
+static char rx_line[RX_LINE_MAX];
+static uint8_t rx_len = 0;
+static volatile uint32_t rx_bytes = 0;
+static volatile uint32_t rx_ore   = 0;
+static volatile uint32_t rx_lines = 0;
+#define CMD_QUEUE_DEPTH 8U
+#define CMD_QUEUE_MASK  (CMD_QUEUE_DEPTH - 1U)
+static char cmd_line_queue[CMD_QUEUE_DEPTH][RX_LINE_MAX];
+static volatile uint8_t cmd_q_head = 0;
+static volatile uint8_t cmd_q_tail = 0;
+
+/* ---- ISR->??? ????: ISR ?????/??, ??????? ----
+ * ?? ISR ????? vsnprintf / ???, ??????? */
+#define RPL_NONE  0
+#define RPL_OK    1
+#define RPL_STAT  2
+#define RPL_HELP  3
+#define RPL_ERR   4
+#define RPL_PCM_STAT 5
+enum { RC_NONE, RC_IGAIN, RC_QGAIN, RC_PHASE, RC_QUAD, RC_IDC, RC_QDC,
+       RC_AGAIN, RC_MODE, RC_TONE, RC_STREAM, RC_SIDE, RC_TX, RC_RX, RC_STAT, RC_HELP,
+       RC_PCMF, RC_PCMV, RC_PCMW, RC_PCMP, RC_PCMS, RC_PCMI, RC_FREQ };
+static volatile uint8_t rpl_kind = RPL_NONE;
+static volatile uint8_t rpl_cmd  = RC_NONE;
+static volatile int32_t rpl_val  = 0;    /* ??? */
+static volatile int32_t rpl_val2 = 0;    /* ??? (STREAM decim) */
+static char rpl_badcmd[12];              /* ERR ???? */
+
+/* ---- ???? (ARM ???? SSAT ???; ????????) ---- */
+#ifndef __SSAT
+static inline int32_t __SSAT(int32_t x, uint32_t sat)
+{
+    int64_t hi = ((int64_t)1 << (sat - 1)) - 1;   /* 2^(sat-1)-1 */
+    int64_t lo = -((int64_t)1 << (sat - 1));      /* -2^(sat-1) */
+    if (x > hi) return (int32_t)hi;
+    if (x < lo) return (int32_t)lo;
+    return x;
+}
+#endif
+
+/* ---- ??????? (ARM ???? USAT ???) ---- */
+#ifndef __USAT
+static inline uint32_t __USAT(int32_t x, uint32_t sat)
+{
+    uint32_t hi = (1u << sat) - 1u;   /* 2^sat - 1 */
+    if (x < 0) return 0;
+    if ((uint32_t)x > hi) return hi;
+    return (uint32_t)x;
+}
+#endif
+
+/* ---- ISR ?: ????? ---- */
+__attribute__((hot))
+static void isr_rx_poll(void)
+{
+    if (USART2->ISR & USART_ISR_ORE) { rx_ore++; USART2->ICR = USART_ICR_ORECF; }
+    while (USART2->ISR & USART_ISR_RXNE_RXFNE)
+    {
+        uint8_t b = (uint8_t)(USART2->RDR & 0xFF);
+        rx_bytes++;
+        if (b == '\n' || b == '\r')
+        {
+            if (rx_len)
+            {
+                rx_lines++;
+                rx_line[rx_len] = 0;
+                {
+                    uint8_t next = (uint8_t)((cmd_q_tail + 1U) & CMD_QUEUE_MASK);
+                    if (next != cmd_q_head) {
+                        memcpy(cmd_line_queue[cmd_q_tail], rx_line, rx_len + 1U);
+                        cmd_q_tail = next;
+                    }
+                }
+                rx_len = 0;
+            }
+        }
+        else if (rx_len < RX_LINE_MAX - 1)
+        {
+            rx_line[rx_len++] = (char)b;
+        }
+    }
+}
+
+static void process_spi_commands(void)
+{
+    for (;;)
+    {
+        char line[RX_LINE_MAX];
+        __disable_irq();
+        if (cmd_q_head == cmd_q_tail) {
+            __enable_irq();
+            break;
+        }
+        memcpy(line, cmd_line_queue[cmd_q_head], RX_LINE_MAX);
+        cmd_q_head = (uint8_t)((cmd_q_head + 1U) & CMD_QUEUE_MASK);
+        __enable_irq();
+        isr_parse(line);
+    }
+}
+
+static void isr_parse(char *line)
+{
+    char cmd[12] = {0};
+    int  i = 0, n = 0, a = 0, b = 0, neg = 0, has_b = 0;
+
+    while (line[i] == ' ' || line[i] == '\t') i++;
+    while (line[i] && line[i] != ' ' && line[i] != '\t' && n < 11)
+    {
+        char c = line[i];
+        if (c >= 'a' && c <= 'z') c -= 32;
+        cmd[n++] = c; i++;
+    }
+    while (line[i] == ' ' || line[i] == '\t') i++;
+    if (line[i] == '-') { neg = 1; i++; }
+    while (line[i] >= '0' && line[i] <= '9') { a = a * 10 + (line[i] - '0'); i++; }
+    if (neg) a = -a;
+    while (line[i] == ' ' || line[i] == '\t') i++;
+    if (line[i] >= '0' && line[i] <= '9')
+    {
+        has_b = 1;
+        while (line[i] >= '0' && line[i] <= '9') { b = b * 10 + (line[i] - '0'); i++; }
+    }
+    if (n == 0) return;
+
+    if (!strcmp(cmd, "IGAIN")) {
+        i_gain_run = (a < 0) ? 0 : (a > 65535) ? 65535 : a;
+        cur_cfg()->igain = i_gain_run; recompute_gains();
+        rpl_kind = RPL_OK; rpl_cmd = RC_IGAIN; rpl_val = i_gain_run;
+    }
+    else if (!strcmp(cmd, "QGAIN")) {
+        q_gain_run = (a < 0) ? 0 : (a > 65535) ? 65535 : a;
+        cur_cfg()->qgain = q_gain_run; recompute_gains();
+        rpl_kind = RPL_OK; rpl_cmd = RC_QGAIN; rpl_val = q_gain_run;
+    }
+    else if (!strcmp(cmd, "PHASE")) {
+        if (a < 0) a = 0;
+        if (a > 360000) a = 360000;
+        phase_off32 = (uint32_t)(((uint64_t)a << 32) / 360000ULL); /* ???, ???->?? */
+        cur_cfg()->phase_off32 = phase_off32;
+        rpl_kind = RPL_OK; rpl_cmd = RC_PHASE; rpl_val = a;
+    }
+    else if (!strcmp(cmd, "QUAD")) {
+        quad_q15 = (int16_t)((a < -32768) ? -32768 : (a > 32767) ? 32767 : a);
+        cur_cfg()->quad = quad_q15; recompute_gains();
+        rpl_kind = RPL_OK; rpl_cmd = RC_QUAD; rpl_val = quad_q15;
+    }
+    else if (!strcmp(cmd, "IDC")) {
+        idc_trim = (int16_t)((a < -1024) ? -1024 : (a > 1024) ? 1024 : a);
+        cur_cfg()->idc = idc_trim; recompute_gains();
+        rpl_kind = RPL_OK; rpl_cmd = RC_IDC; rpl_val = idc_trim;
+    }
+    else if (!strcmp(cmd, "QDC")) {
+        qdc_trim = (int16_t)((a < -1024) ? -1024 : (a > 1024) ? 1024 : a);
+        cur_cfg()->qdc = qdc_trim; recompute_gains();
+        rpl_kind = RPL_OK; rpl_cmd = RC_QDC; rpl_val = qdc_trim;
+    }
+    else if (!strcmp(cmd, "AGAIN")) {
+        audio_gain_run = (a < 0) ? 0 : (a > 1024) ? 1024 : a;
+        cur_cfg()->again = audio_gain_run;
+        rpl_kind = RPL_OK; rpl_cmd = RC_AGAIN; rpl_val = audio_gain_run;
+    }
+    else if (!strcmp(cmd, "MODE")) {
+        mode_run = (uint8_t)((a < 0) ? 0 : (a > 8) ? 8 : a);
+        recompute_gains();
+        if (ptt_cmd) {
+            tx_dsp_reset_req = 1;
+        }
+        rpl_kind = RPL_OK; rpl_cmd = RC_MODE; rpl_val = mode_run;
+    }
+    else if (!strcmp(cmd, "FREQ")) {
+        tuned_freq_hz = (uint32_t)((a < 0) ? 0 : (a > 50000000) ? 50000000 : a);
+        /* v71: a raw frequency change must move the demodulator NCO too.
+         * It did not before, so the host display and the SI5351 followed the
+         * new frequency while the demod kept listening where it was -- the
+         * "scroll several times before it really tunes" symptom. */
+        am_demod_set_freq(tuned_freq_hz);
+        rpl_kind = RPL_OK; rpl_cmd = RC_FREQ; rpl_val = (int32_t)tuned_freq_hz;
+    }
+    else if (!strcmp(cmd, "TONE")) {
+        tone_freq = (uint16_t)((a < 100) ? 100 : (a > 3000) ? 3000 : a);
+        tone_inc  = (uint32_t)(((uint64_t)tone_freq << 32) / 75000ULL); /* ??? */
+        tone_phase = 0;
+        rpl_kind = RPL_OK; rpl_cmd = RC_TONE; rpl_val = tone_freq;
+    }
+    else if (!strcmp(cmd, "STREAM")) {
+        if (rx_mode) stream_en = 0;      /* v20: RX ??????? */
+        else stream_en = (a != 0);
+        if (has_b && b >= 1 && b <= 64) stream_decim = (uint16_t)b;
+        stream_wp = 0; stream_rp = 0; stream_seq = 0; stream_cnt = 0;
+        rpl_kind = RPL_OK; rpl_cmd = RC_STREAM; rpl_val = stream_en; rpl_val2 = stream_decim;
+    }
+    else if (!strcmp(cmd, "SIDE")) {
+        side_run = (a != 0);
+        apply_cfg(cur_cfg());   /* ?????????? (? Q ??) */
+        if (ptt_cmd) {
+            tx_dsp_reset_req = 1;
+        }
+        rpl_kind = RPL_OK; rpl_cmd = RC_SIDE; rpl_val = side_run;
+    }
+    else if (!strcmp(cmd, "TX")) {
+        /* Backward-compatible alias of PTT. */
+        uint8_t was = ptt_cmd;
+        if ((a != 0) && !was) {
+            ptt_cmd = 1;
+            tx_dsp_reset_req = 1;
+        } else {
+            ptt_cmd = (a != 0);
+        }
+        tx_cmd = ptt_cmd;
+        rpl_kind = RPL_OK; rpl_cmd = RC_TX; rpl_val = ptt_cmd;
+    }
+    else if (!strcmp(cmd, "PTT")) {
+        /* v70: PTT is the only TX enable.  The RX chain is always live. */
+        uint8_t was = ptt_cmd;
+        if ((a != 0) && !was) {
+            ptt_cmd = 1;
+            tx_dsp_reset_req = 1;
+        } else {
+            ptt_cmd = (a != 0);
+        }
+        tx_cmd = ptt_cmd;
+        rpl_kind = RPL_OK; rpl_cmd = RC_NONE; rpl_val = ptt_cmd;
+    }
+    else if (!strcmp(cmd, "FDX")) {
+        /* Compatibility only: the receive chain is permanently enabled. */
+        full_duplex_en = (a != 0);
+        if (!rx_chain_en) rx_chain_start();
+        rpl_kind = RPL_OK; rpl_cmd = RC_NONE; rpl_val = full_duplex_en;
+    }
+    else if (!strcmp(cmd, "RX")) {
+        if (a != 0) {
+            ptt_cmd = 0; full_duplex_en = 0;
+            tx_cmd = 0; tx_pc13 = 0; tx_sw = 0;
+            /* RX on: init audio DAC once, start ADC, demod + PCM5102 */
+            rx_mode = 1;
+            stream_en = 0;
+            rx_wp = 0; rx_ready = 0; rx_acquire = 1; rx_div = 0;
+            rx_tx_active = 0;
+            DAC1->DHR12R1 = (uint16_t)DC_OFFSET;
+            DAC1->DHR12R2 = (uint16_t)DC_OFFSET;
+            rx_chain_start();
+        } else {
+            /* RX 0 is retained for compatibility but no longer tears down
+             * ADC1/PCM or the SPI spectrum path. */
+            rx_mode = 0;
+        }
+        rpl_kind = RPL_OK; rpl_cmd = RC_RX; rpl_val = rx_mode;
+    }
+    else if (!strcmp(cmd, "STAT") || !strcmp(cmd, "GET")) {
+        rpl_kind = RPL_STAT; rpl_cmd = RC_STAT;
+    }
+    else if (!strcmp(cmd, "DEMOD")) {
+        /* Set demod frequency and mode in real-time.
+           Demod auto-starts on RX 1, no need for explicit enable.
+           v71: only touch the mode when it actually changes -- rebuilding the
+           filter set on every tuning step reset the AGC and Hilbert history
+           and made fast tuning feel like it had not taken effect. */
+        if (a > 0) {
+            demod_mode_t dm = has_b ? (demod_mode_t)b : am_demod_get_mode();
+            tuned_freq_hz = (uint32_t)a;
+            am_demod_set_mode(dm);
+            am_demod_set_freq((uint32_t)a);
+        }
+        rpl_kind = RPL_OK; rpl_cmd = RC_NONE; rpl_val = a;
+    }
+    else if (!strcmp(cmd, "TUNE")) {
+        /* v71: pure frequency update -- no mode change, no filter rebuild.
+         * The host sends this while the tuning knob/scroll is moving. */
+        if (a > 0) {
+            tuned_freq_hz = (uint32_t)((a > 50000000) ? 50000000 : a);
+            am_demod_set_freq(tuned_freq_hz);
+        }
+        rpl_kind = RPL_OK; rpl_cmd = RC_NONE; rpl_val = (int32_t)tuned_freq_hz;
+    }
+    else if (!strcmp(cmd, "DGAIN")) {
+        /* Demod audio output gain: a = 0..100 maps -40dB..+26dB logarithmically. */
+        if (a < 0) a = 0;
+        if (a > 100) a = 100;
+        float g = 0.01f * powf(2000.0f, (float)a / 100.0f);
+        am_demod_set_audio_gain(g);
+        rpl_kind = RPL_OK; rpl_cmd = RC_NONE; rpl_val = a;
+    }
+    else if (!strcmp(cmd, "HPF")) {
+        /* 50Hz high-pass filter: a=1 enable, a=0 disable */
+        am_demod_set_hpf50(a ? 1 : 0);
+        rpl_kind = RPL_OK; rpl_cmd = RC_NONE; rpl_val = a;
+    }
+    else if (!strcmp(cmd, "NR")) {
+        uint8_t level = has_b ? (uint8_t)b : 1U;
+        am_demod_set_nr(a ? 1U : 0U, level);
+        rpl_kind = RPL_OK; rpl_cmd = RC_NONE; rpl_val = a;
+    }
+    else if (!strcmp(cmd, "HELP")) {
+        rpl_kind = RPL_HELP; rpl_cmd = RC_HELP;
+    }
+    /* PCM5102 audio DAC commands */
+    else if (!strcmp(cmd, "F")) {
+        PCM5102_SetFrequency((uint32_t)((a < 20) ? 20 : (a > 20000) ? 20000 : a));
+        rpl_kind = RPL_PCM_STAT; rpl_cmd = RC_PCMF;
+    }
+    else if (!strcmp(cmd, "V")) {
+        PCM5102_SetVolume((uint8_t)((a < 0) ? 0 : (a > 100) ? 100 : a));
+        rpl_kind = RPL_PCM_STAT; rpl_cmd = RC_PCMV;
+    }
+    else if (!strcmp(cmd, "W")) {
+        PCM5102_SetWave((PCM5102_Wave_t)((a < 0) ? 0 : (a > 4) ? 4 : a));
+        rpl_kind = RPL_PCM_STAT; rpl_cmd = RC_PCMW;
+    }
+    else if (!strcmp(cmd, "P")) {
+        PCM5102_Play();
+        rpl_kind = RPL_PCM_STAT; rpl_cmd = RC_PCMP;
+    }
+    else if (!strcmp(cmd, "S")) {
+        PCM5102_Stop();
+        rpl_kind = RPL_PCM_STAT; rpl_cmd = RC_PCMS;
+    }
+    else if (!strcmp(cmd, "I")) {
+        rpl_kind = RPL_PCM_STAT; rpl_cmd = RC_PCMI;
+    }
+    else {
+        rpl_kind = RPL_ERR; rpl_cmd = RC_NONE;
+        strncpy(rpl_badcmd, cmd, 11); rpl_badcmd[11] = 0;
+    }
+}
+
+/* ---- ???: ?? ISR ????? (???????) ---- */
+static const char *rc_name(uint8_t rc)
+{
+    switch (rc) {
+        case RC_IGAIN:   return "IGAIN";
+        case RC_QGAIN:   return "QGAIN";
+        case RC_PHASE:   return "PHASE";
+        case RC_QUAD:    return "QUAD";
+        case RC_IDC:     return "IDC";
+        case RC_QDC:     return "QDC";
+        case RC_AGAIN:   return "AGAIN";
+        case RC_MODE:    return "MODE";
+        case RC_FREQ:    return "FREQ";
+        case RC_TONE:    return "TONE";
+        case RC_STREAM:  return "STREAM";
+        case RC_SIDE:    return "SIDE";
+        case RC_TX:      return "TX";
+        case RC_RX:      return "RX";
+        case RC_PCMF:    return "F";
+        case RC_PCMV:    return "V";
+        case RC_PCMW:    return "W";
+        case RC_PCMP:    return "P";
+        case RC_PCMS:    return "S";
+        case RC_PCMI:    return "I";
+        default:         return "?";
+    }
+}
+
+/* ---- ???: ?????? ISR ??? (??????, ????) ---- */
+static void flush_reply(void)
+{
+    if (rpl_kind == RPL_NONE) return;
+    char buf[320];   /* v67: STAT 回包 ~269 字符, 原 256 触发 -Wformat-truncation */
+    __disable_irq();
+    uint8_t k = rpl_kind, rc = rpl_cmd;
+    int32_t v = rpl_val, v2 = rpl_val2;
+    char bad[12]; memcpy(bad, rpl_badcmd, 12);
+    rpl_kind = RPL_NONE;
+    __enable_irq();
+
+    int n = 0;
+    if (k == RPL_OK) {
+        if (rc == RC_STREAM)
+            n = snprintf(buf, sizeof buf, "OK STREAM=%ld DECIM=%ld\n", (long)v, (long)v2);
+        else
+            n = snprintf(buf, sizeof buf, "OK %s=%ld\n", rc_name(rc), (long)v);
+    }
+    else if (k == RPL_STAT) {
+        n = snprintf(buf, sizeof buf,
+            "STAT IGAIN=%ld QGAIN=%ld PHASE=%ld QUAD=%d IDC=%d QDC=%d "
+            "AGAIN=%ld MODE=%d FREQ=%lu TONE=%u STREAM=%d DECIM=%u SIDE=%d TX=%d PTT=%d FDX=%d\n",
+            (long)i_gain_run, (long)q_gain_run,
+            (long)(((((uint64_t)phase_off32 * 360000ULL) + (1ULL << 31)) >> 32)),
+            (int)quad_q15, (int)idc_trim, (int)qdc_trim,
+            (long)audio_gain_run, (int)mode_run, (unsigned long)tuned_freq_hz, (unsigned)tone_freq,
+            stream_en, (unsigned)stream_decim, side_run, (int)tx_cmd,
+            (int)ptt_cmd, (int)full_duplex_en);
+    }
+    else if (k == RPL_HELP) {
+        n = snprintf(buf, sizeof buf,
+            "IGAIN QGAIN PHASE QUAD IDC QDC AGAIN MODE(0-8) FREQ TONE STREAM SIDE TX PTT FDX STAT HELP\n"
+            "MODE: 0SSB 1CAR 2I 3Q 4TONE 5MUTE 6CW 7NFM 8AM\n"
+            "PCM5102: F<hz> V<0-100> W<0-4> P S I\n"
+            "DEMOD <hz> [mode]: demod at freq (0=off), output to PCM5102\n"
+            "  mode: 0=AM 1=FM 2=USB 3=LSB 4=CW (default 0)\n");
+    }
+    else if (k == RPL_ERR) {
+        n = snprintf(buf, sizeof buf, "ERR UNKNOWN:%s\n", bad);
+    }
+    else if (k == RPL_PCM_STAT) {
+        n = snprintf(buf, sizeof buf,
+            "PCM fs=%u f=%lu v=%u w=%u play=%u\n",
+            (unsigned)PCM5102_FS, (unsigned long)PCM5102_GetFreq(),
+            (unsigned)PCM5102_GetVolume(), (unsigned)PCM5102_GetWave(),
+            (unsigned)PCM5102_IsPlaying());
+    }
+    if (n > 0) uart2_tx((const uint8_t*)buf, (uint16_t)n);
+}
+
+/* ---- v20: ????? (AA 5A ?, RX_FRAME_N x int16, ????) ---- */
+/* ---- v22.1: RX frame upload limited to 3 frames/sec ----
+ * Previously a new frame was acquired right after each send, so the
+ * rate was capped by 921600 baud at ~22 frames/sec. Now the minimum
+ * interval between frames is 1/3 sec (SAMPLE_RATE/3 = 800000 ticks),
+ * i.e. about 3 frames/sec. Saves UART bandwidth and main-loop time. */
+#define RX_FRAME_PER_SEC      3
+#define RX_FRAME_PERIOD_TICKS ((uint32_t)(SAMPLE_RATE / RX_FRAME_PER_SEC))
+static uint32_t rx_last_frame_tick = 0;
+
+/* ===== SPI3 Slave (frame upload to display MCU) =====
+ * PB2=MOSI(AF7), PC10=SCK(AF6), PC11=MISO(AF6), PA15=NSS(soft input)
+ * Slave, 8-bit, Mode 0. Frame: AA 5A seq len_lo len_hi data[4096]. */
+static void MX_SPI3_Init(void)
+{
+    __HAL_RCC_SPI3_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE(); __HAL_RCC_GPIOC_CLK_ENABLE(); __HAL_RCC_GPIOA_CLK_ENABLE();
+    /* v31.9: 与原spi从机(真实能用)字节级一致:
+     *   Direction=2LINES(v31.6 曾改 TXONLY, 但原spi是 2LINES+HAL 发送, 验证可用)
+     *   PA15=INPUT NOPULL(原spi), 主循环为持续发送(不用 PA15 检测 NSS)
+     *   PC12 指示 GPIO 移除(原spi没有, 防止任何意外干扰) */
+    GPIO_InitTypeDef g = {0};
+    g.Pin = GPIO_PIN_15; g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_NOPULL; /* v31.19: 软件读 NSS(SSI=0 内部 NSS active 不需 AF) */
+    HAL_GPIO_Init(GPIOA, &g);
+    g.Pin = GPIO_PIN_10 | GPIO_PIN_11; g.Mode = GPIO_MODE_AF_PP; g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_HIGH; g.Alternate = GPIO_AF6_SPI3;
+    HAL_GPIO_Init(GPIOC, &g);
+    g.Pin = GPIO_PIN_2; g.Alternate = GPIO_AF7_SPI3;
+    HAL_GPIO_Init(GPIOB, &g);
+    hspi3.Instance = SPI3;
+    hspi3.Init.Mode = SPI_MODE_SLAVE;
+    hspi3.Init.Direction = SPI_DIRECTION_2LINES; /* v31.12: 全双工——H7 TXONLY 释放 MISO 引脚从机发不出; 2LINES 下 MISO 输出, RX 排空防 OVR */
+    hspi3.Init.DataSize = SPI_DATASIZE_8BIT;
+    hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi3.Init.NSS = SPI_NSS_SOFT; /* v31.19: 软件 NSS —— SSI=0 内部 NSS active, 从机在线, SCK 来就移出 */
+    hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    hspi3.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+    hspi3.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+    HAL_SPI_Init(&hspi3);
+    /* v31.10: SSI=1 显式置位(从机内部选中) —— 从机模式 HAL 不置 SSI, 必须在 SPE 前写。
+     * v31.11: 不再在 Init 时 enable —— SPI 保持 disable, HAL_SPI_Transmit 内部 enable,
+     * 此时 SPE=0 则 TSIZE 可写(SPE=1 写保护); 否则 TSIZE=0 -> EOT 永不产生 -> 10s 超时
+     * 每帧。2LINES_TXONLY 关闭 RX, 主机 0xFF 不接收, 无 OVR 挂起。 */
+    /* v31.19 关键: 绝不置 SSI! H7 的 SSI=1 是内部 NSS inactive(从机下线, 永不发送),
+     * 与 F1/F4 习惯相反。SSI=0 -> 内部 NSS active -> 从机在线, SCK 来就移出。 */
+}
+
+/* v31.15 诊断统计 */
+static volatile uint32_t dbg_calls = 0, dbg_nss_high_wait = 0, dbg_txpw = 0, dbg_sck_edge = 0, dbg_last_sck = 0xFF, dbg_prefill = 0;
+static volatile uint32_t dbg_nss_low = 0, dbg_eot = 0, dbg_last_print = 0;
+
+#define SPI3_TX_DMA_ENABLE 1  /* v59c: 1=DMA TX(补数不占CPU, 发送段不禁中断->音频全程连续) 0=CPU版(旧v48禁中断行为,备用) */
+
+static void spi_slave_send(const uint8_t *buf, uint16_t len)
+{
+#if SPI3_TX_DMA_ENABLE
+    /* ---- v59c DMA 版: DMA1_Stream5 硬件补数, 中断全开 ----
+     * TIM2 喂样/48k 解调 poll/PCM5102 半区回调不再被发送段禁中断打断,
+     * 音频连续(无每会话 4.4ms 停顿与净缺口); DMA 补数不依赖 CPU, 频谱帧完整。 */
+    __HAL_SPI_DISABLE(&hspi3);
+    SPI3->IFCR = SPI_IFCR_UDRC | SPI_IFCR_EOTC | SPI_IFCR_OVRC | SPI_IFCR_TXTFC | SPI_IFCR_SUSPC;
+    MODIFY_REG(SPI3->CR2, SPI_CR2_TSIZE, len);
+    uint32_t t0 = sys_tick;
+    dbg_calls++;
+    while (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET) {
+        drain_demod_burst();         /* bounded; never starve watchdog/SPI */
+        process_spi_commands();
+        watchdog_pet();
+        if ((sys_tick - t0) > (uint32_t)(SAMPLE_RATE / 2.0f)) {
+            dbg_nss_high_wait++;
+            return;
+        }
+    }
+    /* v64: D-Cache 写回 —— tx_frame 位于 AXI SRAM(write-back cache 区), CPU
+     * memcpy 后数据可能仍在 L1 Cache; DMA 直读内存会拿到部分陈旧行/旧帧
+     * (随机拼接帧 -> 主机 FFT 半圆包络闪烁/瀑布白线)。发送前强制写回,
+     * 与 pcm5102 音频路径(SCB_CleanDCache_by_Addr)同款做法。 */
+    SCB_CleanDCache_by_Addr((uint32_t *)buf, (int32_t)len);
+    /* 配 DMA1_Stream5: 内存->SPI3_TXDR, 8bit, 内存递增, 普通模式, PL=最高 */
+    DMA1_Stream5->CR = 0;
+    DMA1_Stream5->PAR  = (uint32_t)&SPI3->TXDR;
+    DMA1_Stream5->M0AR = (uint32_t)buf;
+    DMA1_Stream5->NDTR = len;
+    DMA1->HIFCR = DMA_HIFCR_CTCIF5 | DMA_HIFCR_CDMEIF5 | DMA_HIFCR_CTEIF5 | DMA_HIFCR_CHTIF5 | DMA_HIFCR_CFEIF5;
+    DMA1_Stream5->CR = DMA_SxCR_PL_1 | DMA_SxCR_PL_0 | DMA_SxCR_MINC | DMA_SxCR_DIR_0;
+    DMAMUX1_Channel5->CCR = DMA_REQUEST_SPI3_TX;   /* 62: SPI3_TX */
+    SET_BIT(SPI3->CFG1, SPI_CFG1_TXDMAEN);
+    DMA1_Stream5->CR |= DMA_SxCR_EN;
+    __HAL_SPI_ENABLE(&hspi3);
+    /* 等: EOT(移完 len, 最准——DMA TC 会早 ~0.5us 置位, 提前 disable 会丢尾字节)
+     * / NSS 高(主机提前收) / 3s 兜底 */
+    uint32_t t1 = sys_tick;
+    while (1) {
+        drain_demod_burst();         /* bounded; never starve watchdog/SPI */
+        process_spi_commands();
+        watchdog_pet();
+        if (SPI3->SR & SPI_SR_EOT) break;
+        if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET) break;
+        if ((sys_tick - t1) > (uint32_t)(SAMPLE_RATE / 10.0f)) break;
+    }
+    __HAL_SPI_DISABLE(&hspi3);
+    CLEAR_BIT(SPI3->CFG1, SPI_CFG1_TXDMAEN);
+    DMA1_Stream5->CR &= ~DMA_SxCR_EN;
+    DMA1->HIFCR = DMA_HIFCR_CTCIF5 | DMA_HIFCR_CDMEIF5 | DMA_HIFCR_CTEIF5 | DMA_HIFCR_CHTIF5 | DMA_HIFCR_CFEIF5;
+    SPI3->IFCR = SPI_IFCR_UDRC | SPI_IFCR_EOTC | SPI_IFCR_OVRC | SPI_IFCR_TXTFC | SPI_IFCR_SUSPC;
+    return;
+#else
+    /* v44: 流式武装(承自 v31.28 提速) —— 去掉等 NSS 低同步当前会话步骤:
+     * 上一帧 EOT 后主循环立即重装, 只等 NSS 高(会话结束, SPE=0 写 TSIZE 安全)
+     * -> disable -> 写 TSIZE -> 等下一 NSS 低(下降沿) -> enable+预填(紧贴下降沿,
+     * 主机 NSS 低后延迟 1ms 才来 SCK) -> 发送从帧头开始, 永不错位。
+     * 每会话发送 len=2 帧(16402B), 与主机会话读满 16402B 同步, 帧率=会话率。
+     * 保命(承自 v31.28): 发送/等 EOT 期间检测 NSS 高(SCK 停) -> 立即 disable
+     * 放弃, 不再卡 10000ms, 无 10 秒垃圾期。 */
+    uint32_t t0 = HAL_GetTick();
+    dbg_calls++;
+    /* v50: 去掉"等 NSS 高" —— 所有退出路径都已 __HAL_SPI_DISABLE(幂等),
+     * SPE=0 写 TSIZE 恒安全; 不等高直接进"等 NSS 低", 从机在 NSS 低(主机会话)
+     * 内立即 enable+预填+发送, 永不"错过 NSS 高 -> 跳一轮轮空"。 */
+    __HAL_SPI_DISABLE(&hspi3);
+    SPI3->IFCR = SPI_IFCR_UDRC | SPI_IFCR_EOTC | SPI_IFCR_OVRC | SPI_IFCR_TXTFC | SPI_IFCR_SUSPC;
+    MODIFY_REG(SPI3->CR2, SPI_CR2_TSIZE, len);
+    /* 3) 等 NSS 低(下一会话下降沿): enable+预填 紧贴下降沿, 发送从帧头开始 */
+    t0 = HAL_GetTick();
+    while (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET) {
+        if ((HAL_GetTick() - t0) > 500UL) { dbg_nss_high_wait++; return; }
+    }
+    __disable_irq();   /* v48: 预填+发送段禁中断 —— 补数窗口 0.53µs@15M, SysTick/DMA 完成
+                        * 中断打断会使 TXFIFO 空 -> 从机欠载(UDR), MISO 输出 0x00 垃圾段,
+                        * 主机 FFT 出"包络变平"宽带泄漏(实测每秒 ~2 次)。禁中断 ~4.4ms
+                        * 内 HAL_GetTick 冻结, 本段无 tick 依赖; EOT 等待在段外(超时保命)。 */
+    __HAL_SPI_ENABLE(&hspi3);
+    uint32_t i = 0;
+    while (i < len && (SPI3->SR & SPI_SR_TXP)) {   /* 预填到 FIFO 满 */
+        *((volatile uint8_t *)&SPI3->TXDR) = buf[i]; i++;
+    }
+    dbg_prefill = i;
+    /* 4) 发送: 等 TXP 补数 + RX 排空; NSS 高(SCK 停)立即放弃, 无 10s 卡死 */
+    while (i < len) {
+        if (SPI3->SR & SPI_SR_TXP) { *((volatile uint8_t *)&SPI3->TXDR) = buf[i]; i++; dbg_txpw++; }
+        if (SPI3->SR & SPI_SR_RXP) { (void)*((volatile uint8_t *)&SPI3->RXDR); }
+        if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET) { __HAL_SPI_DISABLE(&hspi3); __enable_irq(); return; }
+    }
+    __enable_irq();   /* v48: 恢复中断(发送完成) */
+    /* 5) 等 EOT; NSS 高立即放弃; 3000ms 兜底(正常 70ms 内) */
+    while (!(SPI3->SR & SPI_SR_EOT)) {
+        if (SPI3->SR & SPI_SR_RXP) (void)*((volatile uint8_t *)&SPI3->RXDR);
+        if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET) { __HAL_SPI_DISABLE(&hspi3); return; }
+        if ((HAL_GetTick() - t0) > 3000UL) break;
+    }
+    if (SPI3->SR & SPI_SR_EOT) dbg_eot++;
+    __HAL_SPI_DISABLE(&hspi3);
+    SPI3->IFCR = SPI_IFCR_UDRC | SPI_IFCR_EOTC | SPI_IFCR_OVRC | SPI_IFCR_TXTFC | SPI_IFCR_SUSPC;
+    /* 6) 周期诊断(打印已禁用 v31.24, 保留结构) */
+    if ((HAL_GetTick() - dbg_last_print) >= 1000UL) { dbg_last_print = HAL_GetTick(); }
+#endif
+}
+
+/* ---- v67: SPI 带内命令通道 ----
+ * 主机拉帧事务(全双工 2LINES)的 MOSI 上: 帧数据为 0xFF dummy, 命令为
+ * ASCII 字节 + '\n'。从机从模式 RXNE 中断逐字节收: 过滤 0xFF/控制字符,
+ * 拼 rx_line, 遇 '\n' 入队; 主循环再执行 —— 与 USART2 通道共用同一命令集
+ * (MODE/SIDE/DEMOD/DGAIN/HPF/RX/TX/IGAIN/QGAIN/PHASE/QUAD/IDC/QDC/AGAIN...)。
+ * ISR 只拼行并入队, 主循环执行命令, 避免重命令阻塞 SPI/PCM5102 回调。 */
+void SPI3_IRQHandler(void)
+{
+    if (SPI3->SR & SPI_SR_RXP)
+    {
+        uint8_t c = (uint8_t)(*((volatile uint8_t *)&SPI3->RXDR));
+        if (c >= 0x20 && c <= 0x7E)
+        {
+            if (rx_len < RX_LINE_MAX - 1) rx_line[rx_len++] = (char)c;
+        }
+        else if (c == '\n' || c == '\r')
+        {
+            if (rx_len)
+            {
+                uint8_t next = (uint8_t)((cmd_q_tail + 1U) & CMD_QUEUE_MASK);
+                rx_line[rx_len] = 0;
+                /* CW key state is latency-critical and safe to apply here. */
+                if (!strcmp(rx_line, "TX 1")) tx_cmd = 1;
+                else if (!strcmp(rx_line, "TX 0")) tx_cmd = 0;
+                if (next != cmd_q_head) {
+                    memcpy(cmd_line_queue[cmd_q_tail], rx_line, rx_len + 1U);
+                    cmd_q_tail = next;
+                }
+                rx_len = 0;
+            }
+        }
+    }
+    if (SPI3->SR & SPI_SR_OVR) SPI3->IFCR = SPI_IFCR_OVRC;
+}
+
+static void drain_rx(void)
+{
+    if (rx_ready)
+    {
+        /* v25: 一帧采集完成 -> 构建连续 SPI 帧: AA 5A seq len_lo len_hi + raw ADC.
+         * 原始波形只走 SPI3 回传(串口留给命令通道, 不再占带宽) */
+        rx_ready = 0;
+        rx_last_frame_tick = sys_tick;
+        rx_hdr[0] = 0xAA; rx_hdr[1] = 0x5A;
+        rx_hdr[2] = rx_seq++;
+        rx_hdr[3] = (uint8_t)(RX_FRAME_N & 0xFF);
+        rx_hdr[4] = (uint8_t)((RX_FRAME_N >> 8) & 0xFF);
+        memcpy(tx_frame, rx_hdr, 5);
+        memcpy(tx_frame + 5, rx_buf, 2u * RX_FRAME_N);
+        rx_acquire = 0;    /* v22.1: rate-limit re-acquire (3 frames/s) */
+    }
+    if (!rx_acquire &&
+        (sys_tick - rx_last_frame_tick) >= RX_FRAME_PERIOD_TICKS)
+        rx_acquire = 1;
+}
+
+/* ---- v20: RX ?? TX ??????? DSP ?? ----
+ * ???????????, ????????/???? */
+static void tx_dsp_reset(void)
+{
+    /* v70: coefficients are initialized once at boot.  PTT must only clear
+     * runtime state, otherwise the long coefficient setup can click audio. */
+    memset(dec_buf, 0, sizeof(dec_buf));
+    memset(boxcar_buf, 0, sizeof(boxcar_buf));
+    boxcar_idx = 0;
+    boxcar_sum = 0;
+    dec_wp = 0;
+    pair_idx = 0;
+    split_wp = 0;
+    split_tap = 0;
+    i_acc = 0;
+    q_acc = 0;
+    i_audio_cur = 0;
+    q_audio_cur = 0;
+    i_audio_g_run = 0;
+    q_audio_g_run = 0;
+    i_audio_dac_run = 0;
+    q_audio_dac_run = 0;
+    dec_sample_cnt = 0;
+    tone_phase = 0;
+    l1_x1=l1_x2=l1_y1=l1_y2=0;
+    l2_x1=l2_x2=l2_y1=l2_y2=0;
+    lpf_audio_run = 0;
+    nfm_inc_run = CARRIER_PHASE_INC;
+    am_env_run = AM_CARRIER;
+    carrier_phase = 0;
+    modulation_enabled = (sys_tick >= STARTUP_COUNT);
+    dc_q16 = (2048U << 16);
+    memset(stream_buf, 0, sizeof(stream_buf));
+    stream_wp = 0;
+    stream_rp = 0;
+    stream_seq = 0;
+    stream_cnt = 0;
+    apply_cfg(cur_cfg());    /* ?????????? */
+}
+
+/* ---- ????? (???????) ---- */
+static void drain_stream(void)
+{
+    uint8_t pkt[4 + 4 * STREAM_PKT];
+    while (stream_en)
+    {
+        uint16_t wp = stream_wp;
+        uint16_t avail = (uint16_t)((wp - stream_rp) & STREAM_MASK);
+        if (avail < (uint16_t)(2 * STREAM_PKT)) break;
+
+        pkt[0] = 0xAA; pkt[1] = 0x55;
+        pkt[2] = stream_seq++;
+        pkt[3] = STREAM_PKT;
+        for (int i = 0; i < STREAM_PKT; i++)
+        {
+            uint16_t iv = (uint16_t)stream_buf[stream_rp];
+            uint16_t qv = (uint16_t)stream_buf[stream_rp + 1];
+            pkt[4 + 4*i + 0] = (uint8_t)(iv & 0xFF);
+            pkt[4 + 4*i + 1] = (uint8_t)((iv >> 8) & 0xFF);
+            pkt[4 + 4*i + 2] = (uint8_t)(qv & 0xFF);
+            pkt[4 + 4*i + 3] = (uint8_t)((qv >> 8) & 0xFF);
+            stream_rp = (stream_rp + 2) & STREAM_MASK;
+        }
+        uart2_tx(pkt, 4 + 4 * STREAM_PKT);
+    }
+}
+
+/* ---- ???? (?????, ? 2s; ????????) ---- */
+static void send_info(void)
+{
+    static uint32_t last = 0;
+    if (sys_tick - last < (2u * (uint32_t)SAMPLE_RATE)) return;
+    last = sys_tick;
+    if (stream_en) return;
+    uint32_t uptime = sys_tick / (uint32_t)SAMPLE_RATE;
+    /* v62: 运行期串口 TX 全关(v49 教训: 串口 DMA 打断 SPI 补数窗口 -> MISO 欠载
+     * -> 主机 FFT 频谱泄露)。send_info 保留(后续 SPI 全双工状态上报可复用数据源),
+     * 仅禁打印通道。 */
+#if 0
+    uart2_printf("INFO Up=%us I=%d Q=%d M=%d MOD=%u RXB=%lu RXL=%lu MAXISR=%lu\n",
+        uptime, (int)debug_i_audio, (int)debug_q_audio,
+        (int)mode_run, (unsigned)modulation_enabled,
+        (unsigned long)rx_bytes, (unsigned long)rx_lines,
+        (unsigned long)g_max_isr_cyc);
+#endif
+}
+
+/* ================================================================
+ * TIM2 direct IRQ @2.4MHz
+ * ================================================================ */
+/* ================================================================
+ * TIM2 direct IRQ @2.4MHz  (v5: ????, ?? ISR < 200 ??)
+ * ????: DWT ????, ??"???????????"????,
+ *           ???? ~200 (2.4MHz@480MHz); ? >200 ?? ISR ??????
+ * ================================================================ */
+__attribute__((hot))
+void TIM2_IRQHandler(void)
+{
+#if ISR_TIMING_MEASURE
+    uint32_t _now = _DWT_CYCCNT;
+    uint32_t _dt  = _now - g_prev_isr;
+    g_prev_isr    = _now;
+    if (g_prev_isr_ok && _dt > g_max_isr_cyc) g_max_isr_cyc = _dt;
+    g_prev_isr_ok = 1;
+#endif
+
+    TIM2->SR = ~TIM_SR_UIF;
+    int_count++;
+    sys_tick++;
+    hb_tim2++;
+
+    /* v70: TIM2 is now only the 2.4MHz carrier/DAC engine.  All RX
+     * sampling lives in TIM3 and all TX audio/baseband work lives in TIM4. */
+    if ((int_count & 127u) == 0u)
+        tx_pc13 = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) ? 1 : 0;
+
+    uint8_t tx_key = (uint8_t)(ptt_cmd || tx_cmd || tx_pc13);
+    uint8_t tx_active = tx_key;
+    tx_sw = tx_active;
+
+    if (!tx_active) {
+        DAC1->DHR12R1 = (uint16_t)DC_OFFSET;
+        DAC1->DHR12R2 = (uint16_t)DC_OFFSET;
+        return;
+    }
+
+    modulation_enabled = (sys_tick >= STARTUP_COUNT);
+    {
+        uint32_t inc = (mode_run == 7) ? nfm_inc_run : CARRIER_PHASE_INC;
+        carrier_phase += inc;
+        uint32_t pidx = (carrier_phase >> 20) & LUT_MASK;
+        int16_t cosv = cos_table_q15[pidx];
+
+        if (mode_run == 6)
+        {
+            uint16_t v = (uint16_t)__USAT(DC_OFFSET + (((int32_t)cosv * AMPLITUDE) >> 15), 12);
+            DAC1->DHR12R1 = v;
+            DAC1->DHR12R2 = v;
+        }
+        else if (mode_run == 8)
+        {
+            int32_t m = (am_env_run * cosv) >> 15;
+            uint16_t v = (uint16_t)__USAT(DC_OFFSET + m, 12);
+            DAC1->DHR12R1 = v;
+            DAC1->DHR12R2 = v;
+        }
+        else if (!modulation_enabled || mode_run == 1 || mode_run == 7)
+        {
+            uint16_t v = (uint16_t)__USAT(DC_OFFSET + (((int32_t)cosv * AMPLITUDE) >> 15), 12);
+            DAC1->DHR12R1 = v;
+            DAC1->DHR12R2 = v;
+        }
+        else
+        {
+            uint32_t q_phase = carrier_phase + phase_off32;
+            uint32_t qpidx = (q_phase >> 20) & LUT_MASK;
+            int16_t sinv = sin_table_q15[qpidx];
+            int32_t m1 = i_audio_dac_run * cosv;
+            int32_t m2 = q_audio_dac_run * sinv;
+            DAC1->DHR12R1 = (uint16_t)__USAT(DC_OFFSET + (m1 >> 15), 12);
+            DAC1->DHR12R2 = (uint16_t)__USAT(DC_OFFSET + (m2 >> 15), 12);
+        }
+    }
+    return;
+
+#if 0   /* Legacy mixed RX/TX TIM2 body, superseded by TIM3 + TIM4 below. */
+    /* Hardware CW key is sampled at 18.75kHz in every mode, including
+     * full-duplex RX, so a key press starts the transmitter promptly. */
+    if ((int_count & 127u) == 0u)
+        tx_pc13 = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) ? 1 : 0;
+
+    uint8_t tx_key = (uint8_t)(tx_cmd || tx_pc13);
+    /* Ordinary TX mode is still selected by RX 0.  PTT is only needed for
+     * full-duplex operation, where the display/SPI path stays in TX mode
+     * but the receive chain remains enabled by FDX 1. */
+    uint8_t tx_active = (uint8_t)(ptt_cmd || tx_key || (!rx_mode && !full_duplex_en));
+    tx_sw = tx_active;
+
+    if (rx_chain_en)
+    {
+        /* v69: the RX chain can now run in both RX and full-duplex TX.
+         * Keep the v64 fixed-lag DMA read so ADC1->DR is never stolen. */
+        if ((rx_div++ & 1) == 0)
+        {
+            uint32_t ndtr = (uint16_t)DMA1_Stream0->NDTR;
+            uint32_t wp   = (DMA1_Stream0->CR & DMA_SxCR_CT)
+                          ? (RX_FRAME_N + (RX_FRAME_N - ndtr))
+                          : (RX_FRAME_N - ndtr);
+            uint32_t rp   = (wp + 2u * RX_FRAME_N - 64u) & (2u * RX_FRAME_N - 1u);
+            int16_t _adc  = (rp < RX_FRAME_N) ? (int16_t)adc_dma_buf[rp]
+                                              : (int16_t)adc_dma_buf2[rp - RX_FRAME_N];
+            int16_t _adc_demod = (_adc - 2048) << 4;
+            am_demod_input(_adc_demod);
+        }
+    }
+
+    if (!tx_active) return;
+
+    modulation_enabled = (sys_tick >= STARTUP_COUNT);
+
+    /* --- 1. boxcar-32 ???? --- */
+    {
+        uint32_t raw = (uint32_t)(ADC3->DR & 0xFFFF);
+        int32_t bprev = boxcar_buf[boxcar_idx];
+        boxcar_buf[boxcar_idx] = (int32_t)raw;
+        boxcar_idx = (boxcar_idx + 1) & (DEC_FACTOR - 1);
+        boxcar_sum += (int32_t)raw - bprev;
+    }
+
+    /* --- 2. ???? (75kHz) --- */
+    if (++dec_sample_cnt >= DEC_FACTOR)
+    {
+        dec_sample_cnt = 0;
+        int16_t audio;
+        if (mode_run == 4)
+        {
+            tone_phase += tone_inc;
+            audio = (int16_t)sin_table_q15[(tone_phase >> 20) & LUT_MASK];
+            debug_audio_q15 = audio;
+        }
+        else
+        {
+            int32_t dec = boxcar_sum >> 5;
+            dc_q16 = dc_q16 - (dc_q16 >> 10) + ((uint32_t)dec << 6);
+            int32_t ac = dec - (int32_t)(dc_q16 >> 16);
+            if (ac > -MUTE_THRESHOLD && ac < MUTE_THRESHOLD)
+            {
+                audio = 0;
+            }
+            else
+            {
+                int32_t q = ac * audio_gain_run;
+                if (q >  32767) q =  32767;
+                if (q < -32768) q = -32768;
+                audio = (int16_t)q;
+            }
+            debug_ac_i = ac;
+            debug_audio_q15 = audio;
+        }
+        dec_buf[dec_wp] = audio;
+        dec_buf[dec_wp + DEC_TAPS] = audio;
+        dec_buf[dec_wp + 2 * DEC_TAPS] = audio;
+        dec_wp = (dec_wp + 1) & DEC_MASK;
+
+        /* --- v11: 6kHz 4?IIR?? (?? biquad Q14, int32 ??, ? NFM/AM) ---
+         * v14: ? MODE 7/8 (NFM/AM) ??! SSB/??/CW/??/??????,
+         *      ? SSB ? 128 ?? ISR ???? ~44 ?? (?? 200-119=81)?
+         *      ?????????, ?? NFM/AM ????? */
+        if (mode_run == 7 || mode_run == 8)
+        {
+            int32_t acc1 = (int32_t)LP1_B0 * audio + (int32_t)LP1_B1 * l1_x1
+                         + (int32_t)LP1_B2 * l1_x2 + (int32_t)LP1_A1 * l1_y1
+                         + (int32_t)LP1_A2 * l1_y2;
+            int32_t y1 = acc1 >> 14;
+            if (y1 >  32767) y1 =  32767;
+            if (y1 < -32768) y1 = -32768;
+            l1_x2 = l1_x1; l1_x1 = audio;
+            l1_y2 = l1_y1; l1_y1 = y1;
+            int32_t acc2 = (int32_t)LP2_B0 * y1 + (int32_t)LP2_B1 * l2_x1
+                         + (int32_t)LP2_B2 * l2_x2 + (int32_t)LP2_A1 * l2_y1
+                         + (int32_t)LP2_A2 * l2_y2;
+            int32_t y = acc2 >> 14;
+            if (y >  32767) y =  32767;
+            if (y < -32768) y = -32768;
+            l2_x2 = l2_x1; l2_x1 = y1;
+            l2_y2 = l2_y1; l2_y1 = y;
+            lpf_audio_run = y;                 /* NFM/AM ???? */
+            /* NFM: ???? = ???? + ??(?25k), int32 ?? y*1365 */
+            nfm_inc_run = (uint32_t)(CARRIER_PHASE_INC + y * NFM_DEV_Q15_APPROX);
+            /* AM: ?? = ????*(1 + ??/??) (100% -> env 0..2000) */
+            am_env_run  = AM_CARRIER + ((y * AM_CARRIER) >> 15);
+        }
+
+        int32_t scope_value;
+        if (mode_run == 6)
+            scope_value = tx_key
+                        ? (int32_t)(sin_table_q15[(carrier_phase >> 20) & LUT_MASK] >> 5)
+                        : 0;
+        else if (mode_run == 7 || mode_run == 8)
+            scope_value = lpf_audio_run;
+        else if (mode_run == 0)
+            scope_value = i_audio_g_run;
+        else if (mode_run == 4)
+            scope_value = audio;
+        else
+            scope_value = 0;
+
+        /* Track and remove ADC/audio DC so zero input is a true center line. */
+        if (mode_run != 6) {
+            tx_scope_dc += (scope_value - tx_scope_dc) >> 15;
+            scope_value -= tx_scope_dc;
+        }
+        int16_t scope_sample = (int16_t)__SSAT(scope_value, 16);
+
+        /* Stop capturing while a completed frame is waiting for the host.
+         * This keeps both buffers stable until the main loop snapshots them. */
+        if (!tx_scope_ready) {
+            tx_scope_buf[tx_scope_active][tx_scope_wp++] = (uint16_t)scope_sample;
+            if (tx_scope_wp >= TX_SCOPE_N) {
+                tx_scope_wp = 0;
+                tx_scope_ready = (uint8_t)(tx_scope_active + 1U);
+                tx_scope_active ^= 1U;
+            }
+        }
+    }
+
+    /* --- 3. ?????: SLICE=1 ? ISR 1 ? MAC ---
+     * ?? 128 ISR -> ??? 18.75kHz (?? 0-3k, Nyquist 9.375k ??)?
+     * split_wp ????????, ?????????? */
+    if (mode_run == 0 || mode_run == 2 || mode_run == 3 || mode_run == 4)
+    {
+        uint16_t n0 = pair_idx;              /* 0..127 */
+        uint16_t lo0 = (uint16_t)(split_wp + 255 - n0);
+        uint16_t hi0 = (uint16_t)(split_wp + n0);
+        int32_t xp0 = dec_buf[lo0];
+        int32_t xm0 = dec_buf[hi0];
+        i_acc += (int64_t)((int32_t)g_q15[n0] * (xp0 + xm0));
+        q_acc += (int64_t)((int32_t)h_q15[n0] * (xp0 - xm0));
+        if (++pair_idx >= DEC_HALF)
+        {
+            pair_idx = 0;
+            split_wp = dec_wp;               /* ????????? */
+            i_audio_cur = (int16_t)(i_acc >> 15);
+            q_audio_cur = (int16_t)(q_acc >> 15);
+            i_acc = 0; q_acc = 0;
+            recompute_gains();               /* ? 128 ISR ??, ?? <1 ?? */
+            /* v13: STREAM ??????? (18.75kHz ??, ?????)?
+             * ??????????, ?????????????????:
+             *   ??/CW  -> ?? (?????? 465k ???)
+             *   NFM/AM   -> 6k ????? (465k?6k ???)
+             *   SSB/?? -> I/Q ??? (?????)
+             *   ??     -> 0 (???, ????) */
+            if (stream_en && (++stream_cnt >= stream_decim))
+            {
+                stream_cnt = 0;
+                int32_t si, sq;
+                switch (mode_run)
+                {
+                    case 1:  si = AMPLITUDE; sq = 0; break;              /* ??? */
+                    case 6:  si = tx_sw ? AMPLITUDE : 0; sq = 0; break;  /* CW */
+                    case 7:                                               /* NFM */
+                    case 8:  si = lpf_audio_run; sq = 0; break;          /* AM */
+                    case 5:  si = 0; sq = 0; break;                      /* ?? */
+                    default: si = i_audio_g_run; sq = q_audio_g_run; break;
+                }
+                stream_buf[stream_wp]   = (int16_t)__SSAT(si, 16);
+                stream_buf[stream_wp+1] = (int16_t)__SSAT(sq, 16);
+                stream_wp = (stream_wp + 2) & STREAM_MASK;
+            }
+            /* v14: debug ????????, ? 128 ?? ISR ? (?? ISR 2 ? volatile ?) */
+            debug_i_audio = i_audio_cur;
+            debug_q_audio = q_audio_cur;
+        }
+    }
+    else
+    {
+        /* v69: only SSB needs the 128-tap phase splitter.  AM/FM/CW used
+         * to execute this 64-bit MAC at 2.4MHz even though its output was
+         * never selected, which made full-duplex operation unnecessarily
+         * expensive. */
+        pair_idx = 0;
+        split_wp = dec_wp;
+        i_acc = 0;
+        q_acc = 0;
+    }
+
+    /* --- 4. ?? (????? ISR ??; ??/??/???? recompute_gains ???) --- */
+    uint32_t inc = (mode_run == 7) ? nfm_inc_run : CARRIER_PHASE_INC;  /* NFM ????? */
+    carrier_phase += inc;
+    uint32_t pidx = (carrier_phase >> 20) & LUT_MASK;
+    int16_t cosv = cos_table_q15[pidx];
+
+    if (mode_run == 6)
+    {
+        /* CW: carrier on/off by CW key only; PTT arms the TX chain but
+         * does not key a tone. */
+        uint16_t v = (uint16_t)__USAT(DC_OFFSET + (tx_key ? (((int32_t)cosv * AMPLITUDE) >> 15) : 0), 12);
+        DAC1->DHR12R1 = v;
+        DAC1->DHR12R2 = v;
+    }
+    else if (!tx_active)
+    {
+        DAC1->DHR12R1 = (uint16_t)DC_OFFSET;
+        DAC1->DHR12R2 = (uint16_t)DC_OFFSET;
+    }
+    else if (mode_run == 8)
+    {
+        /* AM: 100% ??????, DAC1=DAC2 ???? */
+        int32_t m = (am_env_run * cosv) >> 15;
+        uint16_t v = (uint16_t)__USAT(DC_OFFSET + m, 12);
+        DAC1->DHR12R1 = v;
+        DAC1->DHR12R2 = v;
+    }
+    else if (!modulation_enabled || mode_run == 1 || mode_run == 7)
+    {
+        /* ?? 1s ??? / MODE=1 ??? / NFM(??????) */
+        DAC1->DHR12R1 = (uint16_t)__USAT(DC_OFFSET + (((int32_t)cosv * AMPLITUDE) >> 15), 12);
+        DAC1->DHR12R2 = (uint16_t)__USAT(DC_OFFSET + (((int32_t)cosv * AMPLITUDE) >> 15), 12);
+    }
+    else
+    {
+        uint32_t q_phase = carrier_phase + phase_off32;
+        uint32_t qpidx = (q_phase >> 20) & LUT_MASK;
+        int16_t sinv = sin_table_q15[qpidx];
+
+        /* m = dac_run * carrier, |dac_run|<=4000, |carrier|<=32767 -> |?|<=1.31e8 int32 ?? */
+        int32_t m1 = i_audio_dac_run * cosv;
+        int32_t m2 = q_audio_dac_run * sinv;
+        DAC1->DHR12R1 = (uint16_t)__USAT(DC_OFFSET + (m1 >> 15), 12);
+        DAC1->DHR12R2 = (uint16_t)__USAT(DC_OFFSET + (m2 >> 15), 12);
+    }
+
+    /* USART2 ??: ?? ISR ??, ??????????????? */
+    /* v59c: 接收轮询禁用(同 rx 分支) */
+#if 0
+    isr_rx_poll();
+#endif
+#endif
+}
+
+/* v70: RX demod feed at 600kHz, independent of TX carrier. */
+__attribute__((hot))
+void TIM3_IRQHandler(void)
+{
+    if (TIM3->SR & TIM_SR_UIF) {
+        TIM3->SR = ~TIM_SR_UIF;
+        hb_tim3++;
+        if (rx_chain_en) {
+            uint32_t ndtr = (uint16_t)DMA1_Stream0->NDTR;
+            uint32_t wp   = (DMA1_Stream0->CR & DMA_SxCR_CT)
+                          ? (RX_FRAME_N + (RX_FRAME_N - ndtr))
+                          : (RX_FRAME_N - ndtr);
+            uint32_t rp   = (wp + 2u * RX_FRAME_N - 64u) & (2u * RX_FRAME_N - 1u);
+            int16_t adc   = (rp < RX_FRAME_N) ? (int16_t)adc_dma_buf[rp]
+                                              : (int16_t)adc_dma_buf2[rp - RX_FRAME_N];
+            /* v71: rail detector.  Strong-signal harmonics that show up in the
+             * spectrum are almost always the analog front end or the ADC
+             * itself clipping; the DSP cannot undo that, but it can report it
+             * so the UI can warn before the user blames the demodulator. */
+            if (adc <= 4 || adc >= 4091) adc_clip_cnt++;
+            am_demod_input((int16_t)((adc - 2048) << 4));
+        }
+    }
+}
+
+/* v70: TX audio and baseband at 75kHz.  ADC3 stays continuous and TIM4
+ * samples it at 75kHz; SSB does one 128-tap block every fourth sample. */
+__attribute__((hot))
+void TIM4_IRQHandler(void)
+{
+    if (!(TIM4->SR & TIM_SR_UIF)) return;
+    TIM4->SR = ~TIM_SR_UIF;
+    hb_tim4++;
+
+    /* v71: deferred TX DSP reset (see tx_dsp_reset_req).  Done on the TX DSP
+     * tick itself so the audio state is never observed half-cleared, and
+     * without touching the global interrupt mask. */
+    if (tx_dsp_reset_req) {
+        tx_dsp_reset_req = 0;
+        tx_dsp_reset();
+    }
+
+    if (!(ptt_cmd || tx_cmd || tx_pc13)) return;
+    if (mode_run == 1 || mode_run == 5 || mode_run == 6) return;
+
+    int16_t audio;
+    if (mode_run == 4)
+    {
+        tone_phase += tone_inc;
+        audio = (int16_t)sin_table_q15[(tone_phase >> 20) & LUT_MASK];
+    }
+    else
+    {
+        int32_t dec = (int32_t)(ADC3->DR & 0xFFFF);
+        dc_q16 = dc_q16 - (dc_q16 >> 10) + ((uint32_t)dec << 6);
+        int32_t ac = dec - (int32_t)(dc_q16 >> 16);
+        if (ac > -MUTE_THRESHOLD && ac < MUTE_THRESHOLD)
+        {
+            audio = 0;
+        }
+        else
+        {
+            int32_t q = ac * audio_gain_run;
+            if (q >  32767) q =  32767;
+            if (q < -32768) q = -32768;
+            audio = (int16_t)q;
+        }
+        debug_ac_i = ac;
+    }
+    debug_audio_q15 = audio;
+
+    dec_buf[dec_wp] = audio;
+    dec_buf[dec_wp + DEC_TAPS] = audio;
+    dec_buf[dec_wp + 2 * DEC_TAPS] = audio;
+    dec_wp = (dec_wp + 1) & DEC_MASK;
+
+    if (mode_run == 7 || mode_run == 8)
+    {
+        int32_t acc1 = (int32_t)LP1_B0 * audio + (int32_t)LP1_B1 * l1_x1
+                     + (int32_t)LP1_B2 * l1_x2 + (int32_t)LP1_A1 * l1_y1
+                     + (int32_t)LP1_A2 * l1_y2;
+        int32_t y1 = acc1 >> 14;
+        if (y1 >  32767) y1 =  32767;
+        if (y1 < -32768) y1 = -32768;
+        l1_x2 = l1_x1; l1_x1 = audio;
+        l1_y2 = l1_y1; l1_y1 = y1;
+        int32_t acc2 = (int32_t)LP2_B0 * y1 + (int32_t)LP2_B1 * l2_x1
+                     + (int32_t)LP2_B2 * l2_x2 + (int32_t)LP2_A1 * l2_y1
+                     + (int32_t)LP2_A2 * l2_y2;
+        int32_t y = acc2 >> 14;
+        if (y >  32767) y =  32767;
+        if (y < -32768) y = -32768;
+        l2_x2 = l2_x1; l2_x1 = y1;
+        l2_y2 = l2_y1; l2_y1 = y;
+        lpf_audio_run = y;
+        nfm_inc_run = (uint32_t)(CARRIER_PHASE_INC + y * NFM_DEV_Q15_APPROX);
+        am_env_run  = AM_CARRIER + ((y * AM_CARRIER) >> 15);
+    }
+
+    if (mode_run == 0 || mode_run == 2 || mode_run == 3 || mode_run == 4)
+    {
+        if (split_tap == 0U)
+        {
+            i_acc = 0;
+            q_acc = 0;
+            for (uint16_t n = 0; n < DEC_HALF; n++)
+            {
+                ssb_win_hi[n] = dec_buf[dec_wp + DEC_TAPS - 1u - n];
+                ssb_win_lo[n] = dec_buf[dec_wp + n];
+            }
+        }
+        uint16_t end_tap = split_tap + SSB_TAPS_PER_TICK;
+        if (end_tap > DEC_HALF) end_tap = DEC_HALF;
+        for (uint16_t n = split_tap; n < end_tap; n++)
+        {
+            int32_t xp = ssb_win_hi[n];
+            int32_t xm = ssb_win_lo[n];
+            i_acc += (int64_t)((int32_t)g_q15[n] * (xp + xm));
+            q_acc += (int64_t)((int32_t)h_q15[n] * (xp - xm));
+        }
+        split_tap = end_tap;
+        if (split_tap >= DEC_HALF)
+        {
+            split_tap = 0;
+            i_audio_cur = (int16_t)(i_acc >> 15);
+            q_audio_cur = (int16_t)(q_acc >> 15);
+            recompute_gains();
+            debug_i_audio = i_audio_cur;
+            debug_q_audio = q_audio_cur;
+        }
+    }
+    else
+    {
+        split_tap = 0;
+        i_acc = 0;
+        q_acc = 0;
+    }
+}
+
+/* ========== main ========== */
+int main(void)
+{
+    HAL_Init();
+    MPU_Config_Audio();  /* v64: 重新启用 —— 仅覆盖 ADC DMA 双缓冲 16KB(见函数内 Size),
+                          * 不再波及 0x24004000 起的音频缓冲/0x24005000 起的调制变量 */
+    SCB_EnableICache();
+    SCB_EnableDCache();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_DAC1_Init();
+    MX_ADC3_Init();
+    MX_ADC1_Init();
+    MX_USART2_UART_Init();
+    MX_SPI3_Init();  /* v24: SPI3 slave (frame upload to display MCU) */
+    /* v67: 使能 SPI3 RX 中断 —— 全双工帧事务期间收主机 MOSI 带内命令。
+     * 优先级 6(低于 TIM2 喂样 0), ISR 极短; 持续读 RXDR 同时消除 RX FIFO
+     * 满 -> OVR 状态(原仅会话末清一次)。 */
+    __HAL_SPI_ENABLE_IT(&hspi3, SPI_IT_RXP);   /* v67: RXP 中断使能 (IER 寄存器) */
+    HAL_NVIC_SetPriority(SPI3_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(SPI3_IRQn);
+    /* SAI/PCM5102 init deferred to RX mode to avoid disturbing TX modulator */
+    s_audio_dac_inited = 0;
+    am_demod_init();
+    init_iq_splitter();
+    /* v8: ??? LSB/USB ??? (???? LSB), SIDE ???????? */
+    cfg_lsb = CFG_LSB_DEFAULT;
+    cfg_usb = CFG_USB_DEFAULT;
+    side_run = 0;
+    apply_cfg(&cfg_lsb);
+#if ISR_TIMING_MEASURE
+    _DEMCR |= (1UL << 24);        /* TRCENA */
+    _DWT_CTRL = 0;
+    _DWT_CYCCNT = 0;
+    _DWT_CTRL |= 1UL;             /* CYCCNTENA */
+#endif
+    MX_TIM2_Init();
+    MX_TIM3_Init();
+    MX_TIM4_Init();
+
+    uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
+    __HAL_TIM_SET_PRESCALER(&htim2, 0);
+    __HAL_TIM_SET_AUTORELOAD(&htim2, 99);
+    __HAL_TIM_SET_COUNTER(&htim2, 0);
+    trigger_freq = (float)pclk1 / 100.0f;
+
+    uart2_printf("PCLK1=%luHz Fs=%.0fHz USART2=%lu single-port RX-in-ISR\n",
+        (unsigned long)pclk1, trigger_freq, (unsigned long)USART2_BAUDRATE);
+    uart2_puts("HELLO SSB-IQ-TUNER v8\n");
+    uart2_puts("USART2 cmd: STAT/HELP SIDE TX (send HELP to list)\n");
+    /* v20.2: ??????????, ??????????? */
+    uart2_printf("BOOT-LSB IGAIN=%ld QGAIN=%ld PHASE=%ld QUAD=%d IDC=%d QDC=%d AGAIN=%ld\n",
+        (long)cfg_lsb.igain, (long)cfg_lsb.qgain,
+        (long)(((((uint64_t)cfg_lsb.phase_off32 * 360000ULL) + (1ULL << 31)) >> 32)),
+        (int)cfg_lsb.quad, (int)cfg_lsb.idc, (int)cfg_lsb.qdc, (long)cfg_lsb.again);
+    uart2_printf("BOOT-USB IGAIN=%ld QGAIN=%ld PHASE=%ld QUAD=%d IDC=%d QDC=%d AGAIN=%ld\n",
+        (long)cfg_usb.igain, (long)cfg_usb.qgain,
+        (long)(((((uint64_t)cfg_usb.phase_off32 * 360000ULL) + (1ULL << 31)) >> 32)),
+        (int)cfg_usb.quad, (int)cfg_usb.idc, (int)cfg_usb.qdc, (long)cfg_usb.again);
+
+    init_sin_table();
+    carrier_phase = 0;
+    /* v31.38-DIAG: 降触发率实验(ARR 99->199) —— 已完结, 必须保持 99!
+     * 该实验针对旧"外部触发"链路; v57 已改用 ADC 连续模式+DBM 双缓冲, 触发链路
+     * 完全旁路, 实验残留须禁用。若 ARR=199 生效: TIM2 tick=1.2M(应2.4M)
+     * -> RX 解调链全部减半(喂样600k/poll24k, 应1.2M/48k) -> PCM5102 以48k读取
+     * 只有一半数据(读空补0=静音) -> 用户示波器实测"~200Hz断续/50%时间静音"
+     * 且 NCO 按 1.2M 设计对不上 600k 实际采样(465k混叠) -> 声音无法分辨。
+     * 需要重跑该实验时临时打开 #if 1。 */
+#if 0
+    __HAL_TIM_SET_AUTORELOAD(&htim2, 199);
+#endif
+    HAL_TIM_Base_Start_IT(&htim2);
+
+    /* v24: 上电默认进入 RX 模式(便于直接测频谱), 与 "RX 1" 命令路径一致:
+     * 初始化音频 DAC / ADC1 采集 / 解调 / PCM5102 播放 */
+    audio_dac_init_once();
+    uart2_printf("SPI3 REG CR1=%08lx CR2=%08lx CFG1=%08lx CFG2=%08lx SR=%08lx\n",
+        (unsigned long)SPI3->CR1, (unsigned long)SPI3->CR2,
+        (unsigned long)SPI3->CFG1, (unsigned long)SPI3->CFG2,
+        (unsigned long)SPI3->SR);
+
+    stream_en = 0;
+    rx_wp = 0; rx_ready = 0; rx_acquire = 1; rx_div = 0;
+    rx_tx_active = 0;
+    DAC1->DHR12R1 = (uint16_t)DC_OFFSET;
+    DAC1->DHR12R2 = (uint16_t)DC_OFFSET;
+
+    /* v31.41-RAW: 手动配置 ADC1->DMA1_Stream0(环形), 绕开 HAL_DMA_Init/Start_IT 读-改-写链路。
+     * v31.40d 实测该链路运行时 DMA1_Stream0 CR=0x1e 仅剩中断使能位, CIRC/MINC/PSIZE/MSIZE
+     * 全部丢失 -> DMA 按非环形+内存不递增搬运, 2048 项全写 buf[0] 后停止(NDTR=0, EN=0)。
+     * 此处寄存器直写一次成型。判别: CR 应持续保持 0x2D17(配置+中断+EN), NDTR 环形变化,
+     * 缓冲出现多样 ADC 值(不再全 0)。 */
+    __HAL_RCC_DMA1_CLK_ENABLE();                       /* 保险: DMA1 时钟 */
+    DMAMUX1_Channel0->CCR = DMA_REQUEST_ADC1;          /* 请求源: ADC1(=9) */
+    /* v57-DBM: 双缓冲乒乓(DBM=1, CT 位指示当前写缓冲), 清 CIRC/中断 ——
+     * 硬件自动 M0AR<->M1AR 切换, 无需中断(CT 轮询), 避免 DMA 完成中断打断 SPI 发送(v49 教训)。
+     * PL=11(超高): 总线仲裁偏向 DMA, 降低 CPU memcpy 读 AXI 时 DMA 搬移被延迟的概率。 */
+    DMA1_Stream0->CR = DMA_SxCR_DBM
+                     | (3UL << DMA_SxCR_PL_Pos)        /* PL=11 最高优先级 */
+                     | DMA_SxCR_MINC
+                     | (1UL << DMA_SxCR_PSIZE_Pos)     /* PSIZE=01 半字 */
+                     | (1UL << DMA_SxCR_MSIZE_Pos);    /* MSIZE=01 半字 */
+    DMA1_Stream0->PAR  = (uint32_t)&ADC1->DR;          /* 外设地址, DIR=00 外设->内存 */
+    DMA1_Stream0->M0AR = (uint32_t)adc_dma_buf;        /* 缓冲 A(AXI SRAM) */
+    DMA1_Stream0->M1AR = (uint32_t)adc_dma_buf2;       /* 缓冲 B(乒乓对) */
+    DMA1_Stream0->NDTR = RX_FRAME_N;
+    __DMB();                                           /* 地址/长度先于 EN 写入 */
+    DMA1_Stream0->CR |= DMA_SxCR_EN;                   /* 使能流 */
+    ADC1->CFGR |= 0x3UL;                               /* bit0 DMAEN + bit1 DMACFG(环形) */
+    ADC1->CR |= ADC_CR_ADEN;                           /* v31.42: 使能 ADC(替代 HAL_ADC_Start_DMA 内部 LL_ADC_Enable, 漏掉则 ADSTART 写无效) */
+    {   uint32_t adr_wait = 1000000UL;                 /* v31.42: 等 ADRDY(校准后需 >4 个 ADCCLK; 有限循环防卡死) */
+        while (!(ADC1->ISR & ADC_ISR_ADRDY) && --adr_wait) {}
+    }
+    ADC1->CFGR &= ~ADC_CFGR_EXTEN_Msk;                 /* v31.44-CONT2: 清外部触发边沿(纯连续, 无任何触发源, TIM2 触发完全旁路) */
+    ADC1->CFGR |= ADC_CFGR_CONT;                       /* 连续模式: 转换结束立即下一次, 采样率约3M/s */
+    ADC1->CR |= ADC_CR_ADSTART;                        /* 启动规则转换(连续模式立即开始) */
+    adc_db_ready = 0;                                  /* v57: 复位首圈标志(等 CT 翻转为 1) */
+    {
+        char dbg[96];
+        int dn2 = snprintf(dbg, sizeof dbg,
+            "RAW-DMA CR=%08lx NDTR=%04lx M0AR=%08lx\n",
+            (unsigned long)DMA1_Stream0->CR,
+            (unsigned long)(DMA1_Stream0->NDTR & 0xFFFF),
+            (unsigned long)DMA1_Stream0->M0AR);
+        if (dn2 > 0) (void)uart2_tx_dma((uint8_t*)dbg, (uint16_t)dn2);
+    }
+    /* ===== v31.45: 实测连续模式采样率 (DWT CYCCNT, 测 DMA 消耗 1024 点耗时) =====
+     * 采样率 = 1024 / dt, dt 以 SYSCLK=480MHz 周期计。供主机 FFT 横轴标定(0-600kHz 依赖真实采样率)。 */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    {
+        uint32_t nd0 = DMA1_Stream0->NDTR & 0xFFFF;
+        uint32_t t0 = DWT->CYCCNT;
+        for (;;) {
+            uint32_t nd = DMA1_Stream0->NDTR & 0xFFFF;
+            uint32_t consumed = (nd0 >= nd) ? (nd0 - nd) : (nd0 + 2048u - nd);
+            if (consumed >= 1024u) break;
+        }
+        uint32_t dt = DWT->CYCCNT - t0;               /* 1024 点耗时(480M 周期) */
+        uint32_t fs = (uint32_t)((uint64_t)1024u * 480000000u / dt);
+        while (hdma_usart2_tx.State != HAL_DMA_STATE_READY) {}  /* v31.45b: 等串口 DMA 空闲(忙即丢会吞掉紧跟的 FSAMP 行) */
+        char srate[96];
+        int sn = snprintf(srate, sizeof srate, "FSAMP dt=%lu fs=%lu\n",
+                          (unsigned long)dt, (unsigned long)fs);
+        if (sn > 0) (void)uart2_tx_dma((uint8_t*)srate, (uint16_t)sn);
+    }
+    am_demod_enable(1);
+    PCM5102_SetDemodMode(1);
+    PCM5102_Play();
+    /* v70: start split RX/TX timers only after ADC1 DMA, demod and PCM are ready. */
+    HAL_TIM_Base_Start_IT(&htim3);
+    HAL_TIM_Base_Start_IT(&htim4);
+    /* v31.35-DIAG: ADC1 运行时寄存器 —— 必须在 HAL_ADC_Start 之后(启动前 ADEN=0/DR=0 无意义);
+     * uart2_printf 已禁用, 走 uart2_tx_dma */
+    {
+        static char adc1_diag[160];
+        int n = snprintf(adc1_diag, sizeof adc1_diag,
+            "ADC1 CR=%08lx CFGR=%08lx SMPR1=%08lx ISR=%08lx DR=%04x\n",
+            (unsigned long)ADC1->CR, (unsigned long)ADC1->CFGR,
+            (unsigned long)ADC1->SMPR1, (unsigned long)ADC1->ISR,
+            (unsigned)(ADC1->DR & 0xFFFF));
+        if (n > 0) uart2_tx_dma((uint8_t*)adc1_diag, n);
+    }
+
+    watchdog_start();
+    uint32_t last_rep = 0;
+    while (1)
+    {
+        process_spi_commands();
+        drain_demod_burst();
+        hb_main++;
+        watchdog_pet();
+        /* flush_reply();  v62: 运行期串口 TX 全关(SPI 补数窗口不可被串口 DMA 打断);
+         * 命令解析函数保留待 SPI 全双工控制复用。 */
+        {
+            /* v70: the spectrum path never changes with PTT. */
+            if (!adc_db_ready) {
+                if (DMA1_Stream0->CR & DMA_SxCR_CT) adc_db_ready = 1;
+                else continue;
+            }
+            uint16_t *adc_src = (DMA1_Stream0->CR & DMA_SxCR_CT)
+                              ? (uint16_t*)adc_dma_buf
+                              : (uint16_t*)adc_dma_buf2;
+            SCB_InvalidateDCache_by_Addr((uint32_t*)adc_src, 2u * RX_FRAME_N);
+            memcpy(tx_frame + 5, (uint8_t*)adc_src, 2u * RX_FRAME_N);
+            /* v71: peak-crest measurement on the raw frame.  A pure sine has
+             * peak/rms = sqrt(2) = 1.414; a hard-limited (square-ish) input
+             * approaches 1.0.  This is how the UI can tell the operator that
+             * the harmonics on screen were produced *before* the ADC -- no
+             * amount of demod filtering can remove them. */
+            {
+                uint32_t fsum = 0, fsq = 0;
+                uint16_t fmin = 0xFFFF, fmax = 0;
+                for (int i = 0; i < RX_FRAME_N; i++) {
+                    uint16_t v = adc_src[i];
+                    fsum += v; fsq += (uint32_t)v * v;
+                    if (v < fmin) fmin = v;
+                    if (v > fmax) fmax = v;
+                }
+                float fmean = (float)fsum / (float)RX_FRAME_N;
+                float fms = (float)fsq / (float)RX_FRAME_N;
+                float fac = fms - fmean * fmean;
+                if (fac > 0.0f) {
+                    float frms = sqrtf(fac);
+                    float fpk = (fmax - fmean > fmean - fmin)
+                              ? (float)fmax - fmean : fmean - (float)fmin;
+                    /* only meaningful when there is real signal, not noise */
+                    crest_ok = !((frms > 40.0f) && (fpk < frms * 1.18f));
+                } else {
+                    crest_ok = 1;
+                }
+            }
+            if (((DMA1_Stream0->CR & DMA_SxCR_CT)
+                 ? (uint16_t*)adc_dma_buf : (uint16_t*)adc_dma_buf2) != adc_src)
+                continue;
+            static uint32_t last_t2 = 0, last_t3 = 0, last_t4 = 0, last_main = 0;
+            uint32_t now_t2 = hb_tim2, now_t3 = hb_tim3;
+            uint32_t now_t4 = hb_tim4, now_main = hb_main;
+            uint8_t health = 0;
+            if (now_t2   != last_t2)   { health |= HEALTH_TIM2;  last_t2 = now_t2; }
+            if (now_t3   != last_t3)   { health |= HEALTH_TIM3;  last_t3 = now_t3; }
+            if (now_t4   != last_t4)   { health |= HEALTH_TIM4;  last_t4 = now_t4; }
+            if (now_main != last_main) { health |= HEALTH_MAIN;  last_main = now_main; }
+            if (rx_chain_en && adc_db_ready) health |= HEALTH_CHAIN;
+            if (PCM5102_IsPlaying()) health |= HEALTH_PCM;
+            /* v71: report front-end overload when a usable fraction of the
+             * frame period was spent on the ADC rails. */
+            if (adc_clip_cnt > 64U) health |= HEALTH_CLIP;
+            adc_clip_cnt = 0;
+            /* FM is meant to be limited, so only flag compression on the
+             * linear modes where a square-ish input really is distortion. */
+            if (!crest_ok && am_demod_get_mode() != DEMOD_MODE_FM)
+                health |= HEALTH_DISTORT;
+            wd_healthy = ((health & (HEALTH_TIM2 | HEALTH_TIM3 |
+                                     HEALTH_TIM4 | HEALTH_MAIN)) ==
+                          (HEALTH_TIM2 | HEALTH_TIM3 | HEALTH_TIM4 | HEALTH_MAIN));
+            watchdog_pet();
+            rx_hdr[0] = 0xAA; rx_hdr[1] = 0x5A;
+            rx_hdr[2] = health;
+            rx_hdr[3] = (uint8_t)(RX_FRAME_N & 0xFF);
+            rx_hdr[4] = (uint8_t)((RX_FRAME_N >> 8) & 0xFF);
+            memcpy(tx_frame, rx_hdr, 5);
+            spi_slave_send(tx_frame, (uint16_t)(5U + 2U * RX_FRAME_N));
+        }
+#if 0
+        if (rx_mode)
+        {
+            /* v31.7: 持续发送(完全复刻原spi从机行为, 原spi用 HAL_SPI_Transmit
+             * 循环发送且真实能用, 从未等 NSS): 重建帧 -> 发送 -> 立即下一帧。
+             * TXFIFO 几乎总有数据, 主机 SCK 随时来都能移出; 帧头对齐交给主机
+             * NSS 快路径校验 + 逐字节兜底同步。v31.4 的"等 NSS"依赖 NSS 检测
+             * 正确性, 若 PA15 检测异常会导致从机永不发送(MISO 恒低), 现移除。 */
+            while (rx_mode) {   /* v67: RX 0 命令(RX 模式切换)后退出发送循环, 进入 TX 分支 */
+                process_spi_commands();
+                if (!rx_mode) break;
+                /* v62: 从机运行期严禁任何串口 TX —— v49 教训(串口 DMA 打断 SPI
+                 * 补数窗口 -> MISO 欠载 -> 主机 FFT 频谱泄露)。运行期打印已全部关闭,
+                 * 仅保留上电初始化阶段一次性诊断(uart2_tx_dma 初始化段打印)。 */
+                drain_demod_burst();         /* bounded pre-rebuild drain */
+                rx_hdr[0] = 0xAA; rx_hdr[1] = 0x5A;
+                rx_hdr[2] = (uint8_t)rx_seq++;
+                rx_hdr[3] = (uint8_t)(RX_FRAME_N & 0xFF);
+                rx_hdr[4] = (uint8_t)((RX_FRAME_N >> 8) & 0xFF);
+                memcpy(tx_frame, rx_hdr, 5);
+                {
+                    /* v31.31-TEST: CPU 理想正弦对照(不经过 ADC), 验证主机显示/FFT。
+                     * TEST_SINE=1: 生成 TEST_SINE_F0 理想正弦(300k=整数bin 512 -> 单峰),
+                     *   幅度 +-1000(中心 2048), 相位跨帧连续。
+                     * TEST_SINE=0: 原 v31.30 真实 ADC 频谱回传(逻辑完整保留)。 */
+#if TEST_SINE
+                    static uint32_t rx_phase = 0;
+                    const uint32_t rx_step = (uint32_t)(TEST_SINE_F0 / 3752605.0f * 65536.0f); /* v51: 用实测采样率3.7526M(原1.2M旧值 -> 视在频率=3.127xF0, 200k显示625k超600k屏/300k主峰超bin451不可见 -> 满屏底噪"噪声") */
+                    for (int i = 0; i < RX_FRAME_N; i++) {
+                        int32_t sv = 2048 + (int32_t)(44.0f *     /* v51: 幅度±44与真实ADC同幅(原±1000超大, 对数满量程下主峰过顶不可比) */
+                            sinf(2.0f * 3.14159265f * (float)rx_phase / 65536.0f));
+                        tx_frame[5 + 2 * i]     = (uint8_t)(sv & 0xFF);
+                        tx_frame[6 + 2 * i]     = (uint8_t)((sv >> 8) & 0xFF);
+                        rx_phase += rx_step;
+                    }
+                    rx_acquire = 1;   /* 保持 ISR 活跃(数据丢弃, 仅测频谱显示) */
+#else
+                    /* v50: 不再 HAL_Delay(2) —— 连续模式 DMA 环形 546µs 一圈, 而主循环
+                     * 每会话(>7ms)才拷贝一次, 缓冲永远写满; 删掉 2ms 让武装时序紧贴上轮
+                     * EOT, 消除"从机循环 2ms > 主机 NSS 高窗口 2ms -> 错过武装跳一轮
+                     * -> 周期性轮空/卡顿"的节奏抖动。 */
+                    /* v57-DBM: 读 CT 选非活动缓冲(CT=0 -> DMA 写 M0AR(A), 拷 M1AR(B); CT=1 反之)。
+                     * 拷源=DMA 已写完一整圈的缓冲, 拷贝期间 DMA 写另一缓冲, 零竞争(消除撕裂)。
+                     * 首圈未满(CT 未变 1)跳过本轮, 防拷到未写的 B。 */
+                    if (!adc_db_ready) {
+                        if (DMA1_Stream0->CR & DMA_SxCR_CT) adc_db_ready = 1;
+                        else continue;
+                    }
+                    uint16_t *adc_src = (DMA1_Stream0->CR & DMA_SxCR_CT)
+                                      ? (uint16_t*)adc_dma_buf   /* CT=1: DMA 写 B, 拷 A */
+                                      : (uint16_t*)adc_dma_buf2; /* CT=0: DMA 写 A, 拷 B */
+                    SCB_InvalidateDCache_by_Addr((uint32_t*)adc_src, 2u * RX_FRAME_N); /* v31.40b: DMA 写内存, CPU 需无效化 D-Cache 再读 */
+                    memcpy(tx_frame + 5, (uint8_t*)adc_src, 2u * RX_FRAME_N); /* v31.40-DMA 源=DMA缓冲(DBM 乒乓) */
+                    /* v63: DBM 撕裂防护 —— memcpy(~4us) 期间 DMA 若恰好完成整圈并切回本缓冲
+                     * (CT 翻转, 周期 1.09ms, 概率 ~0.4%), 帧头帧尾来自两个不连续采集窗口
+                     * (拼接帧), 主机 FFT 会出现跳变伪峰/包络抖动。复查 CT: 已切换则本帧
+                     * 作废, continue 跳过本轮发送(主机保留上一帧频谱, 肉眼不可见),
+                     * 下一轮再取完整新帧。 */
+                    if (((DMA1_Stream0->CR & DMA_SxCR_CT)
+                         ? (uint16_t*)adc_dma_buf : (uint16_t*)adc_dma_buf2) != adc_src)
+                        continue;
+                    /* v49: DMA 诊断打印已删 —— 取证完成。该打印的 DMA 完成中断
+                     * (每 ~98ms) 打断 SPI 发送补数窗口 -> 从机欠载 -> MISO 0x00 段
+                     * -> 主机频谱"包络变平"泄漏(0.6s 一次)。源头移除。 */
+#endif
+                }
+                /* v70: one frame per SPI session; the host only needs one FFT. */
+                memcpy(tx_frame + (5 + 2u * RX_FRAME_N), tx_frame, 5 + 2u * RX_FRAME_N);
+                /* v43: 恢复 SPI 发送(双电平根因=外部触发链路, 已用连续模式旁路;
+                 * SPI 阻塞发送不影响 DMA 连续采样)。v31.35 曾临时跳此以隔离 SPI 干扰。 */
+                spi_slave_send(tx_frame, 2u * (5 + 2u * RX_FRAME_N));
+                /* v60: 解调排空已移到 send 等待循环(等 NSS/等 EOT 轮询期) + 本循环顶部
+                 * 重建前排空 —— ISR poll 已 #if 0(见 TIM2 ISR), 20 阶滤波无 ISR 预算压力。 */
+                /* v49: RX hex/SLOW 打印块已删 —— 取证完成。
+                 * 根因: 该打印的 DMA 完成中断(每 ~98ms @115200, 打印 1043B) 打断
+                 * SPI 发送补数窗口 -> 从机欠载 -> MISO 0x00 段 -> 主机频谱
+                 * "包络变平"泄漏(实测 0.6s 一次)。源头移除, 配合 v48 禁中断双保险。 */
+            }
+        }
+        else
+        {
+            /* v67: TX 模式保持 SPI 从机 enable —— 主机带内命令(RX 1 切回接收等)
+             * 仍能收; MISO 无帧数据(主机无 AA 5A -> 频谱停更, 发射态无碍)。 */
+            if (!(SPI3->CR1 & SPI_CR1_SPE)) __HAL_SPI_ENABLE(&hspi3);
+            if (tx_scope_ready) {
+                uint8_t ready = tx_scope_ready;
+                /* The ISR pauses capture while tx_scope_ready is nonzero,
+                 * so this snapshot is stable even during the NSS wait. */
+                uint8_t *src = (uint8_t *)tx_scope_buf[ready - 1U];
+                memcpy(tx_frame + 5, src, 2U * TX_SCOPE_N);
+                tx_scope_ready = 0;
+                tx_frame[0] = 0xAA; tx_frame[1] = 0x5A;
+                tx_frame[2] = (uint8_t)rx_seq++;
+                tx_frame[3] = (uint8_t)(TX_SCOPE_N & 0xFFU);
+                tx_frame[4] = (uint8_t)((TX_SCOPE_N >> 8) & 0xFFU);
+                spi_slave_send(tx_frame, (uint16_t)(5U + 2U * TX_SCOPE_N));
+            }
+            drain_stream();
+            send_info();
+            /* v10: PC13 ???? (??) -> CW ?? */
+            tx_pc13 = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET) ? 1 : 0;
+            tx_sw = (ptt_cmd || tx_cmd || tx_pc13) ? 1 : 0;
+        }
+#endif
+        if (sys_tick - last_rep >= (uint32_t)SAMPLE_RATE)
+        {
+            last_rep = sys_tick;
+            LED_TOGGLE;
+        }
+    }
+}
+
+/* ========== DAC1: TIM2 TRGO trigger, output buffer disable ========== */
+static void MX_DAC1_Init(void)
+{
+    __HAL_RCC_DAC12_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = GPIO_PIN_4 | GPIO_PIN_5;
+    g.Mode = GPIO_MODE_ANALOG;
+    g.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &g);
+    DAC_ChannelConfTypeDef s = {0};
+    s.DAC_Trigger = DAC_TRIGGER_T2_TRGO;
+    s.DAC_OutputBuffer = DAC_OUTPUTBUFFER_DISABLE;
+    s.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
+    s.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_DISABLE;
+    s.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
+    hdac1.Instance = DAC1;
+    if (HAL_DAC_Init(&hdac1) != HAL_OK) Error_Handler();
+    if (HAL_DAC_ConfigChannel(&hdac1, &s, DAC_CHANNEL_1) != HAL_OK) Error_Handler();
+    if (HAL_DAC_ConfigChannel(&hdac1, &s, DAC_CHANNEL_2) != HAL_OK) Error_Handler();
+    if (HAL_DAC_Start(&hdac1, DAC_CHANNEL_1) != HAL_OK) Error_Handler();
+    if (HAL_DAC_Start(&hdac1, DAC_CHANNEL_2) != HAL_OK) Error_Handler();
+}
+
+/* ========== TIM2 ========== */
+static void MX_TIM2_Init(void)
+{
+    __HAL_RCC_TIM2_CLK_ENABLE();
+    htim2.Instance = TIM2;
+    htim2.Init.Prescaler = 0;
+    htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim2.Init.Period = 99;
+    htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_Base_Init(&htim2) != HAL_OK) Error_Handler();
+    TIM_ClockConfigTypeDef sclk = {0};
+    sclk.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+    if (HAL_TIM_ConfigClockSource(&htim2, &sclk) != HAL_OK) Error_Handler();
+    TIM_MasterConfigTypeDef sm = {0};
+    sm.MasterOutputTrigger = TIM_TRGO_UPDATE;
+    sm.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sm) != HAL_OK) Error_Handler();
+    HAL_NVIC_SetPriority(TIM2_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM2_IRQn);
+}
+
+/* v70: RX DDC/anti-alias timer. 240MHz / 200 = 1.2MHz. */
+static void MX_TIM3_Init(void)
+{
+    __HAL_RCC_TIM3_CLK_ENABLE();
+    htim3.Instance = TIM3;
+    htim3.Init.Prescaler = 0;
+    htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+    /* v71: 240MHz/368 = 652.1739kHz = ADC_rate/4 exactly (see am_demod.h). */
+    htim3.Init.Period = 367;
+    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_Base_Init(&htim3) != HAL_OK) Error_Handler();
+    TIM_ClockConfigTypeDef sclk = {0};
+    sclk.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+    if (HAL_TIM_ConfigClockSource(&htim3, &sclk) != HAL_OK) Error_Handler();
+    HAL_NVIC_SetPriority(TIM3_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(TIM3_IRQn);
+}
+
+/* v70: TX audio/baseband timer. 240MHz / 3200 = 75kHz. */
+static void MX_TIM4_Init(void)
+{
+    __HAL_RCC_TIM4_CLK_ENABLE();
+    htim4.Instance = TIM4;
+    htim4.Init.Prescaler = 0;
+    htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim4.Init.Period = 3199;
+    htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_Base_Init(&htim4) != HAL_OK) Error_Handler();
+    TIM_ClockConfigTypeDef sclk = {0};
+    sclk.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+    if (HAL_TIM_ConfigClockSource(&htim4, &sclk) != HAL_OK) Error_Handler();
+    HAL_NVIC_SetPriority(TIM4_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(TIM4_IRQn);
+}
+
+/* ========== ADC1: IN3 ?? (PA6=INP/PA7=INN), 12bit, TIM2 TRGO ?? ==========
+ * ? DAC ?? TIM2 TRGO (2.4MHz), ?????????????
+ * ????: Vref ??? �Vref/2, ?? 0~4095, ?? 2048 (0V ??)? */
+static void MX_ADC1_Init(void)
+{
+    __HAL_RCC_ADC12_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+    g.Mode = GPIO_MODE_ANALOG;
+    g.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &g);
+    hadc1.Instance = ADC1;
+    hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc1.Init.ScanConvMode = DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+    hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T2_TRGO;  /* v21: ???? (????) */
+    hadc1.Init.NbrOfConversion = 1;
+    hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    hadc1.Init.LowPowerAutoWait = DISABLE;
+    hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+    hadc1.Init.OversamplingMode = DISABLE;
+    hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DMA_CIRCULAR; /* v31.40-DMA */
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+    ADC_ChannelConfTypeDef s = {0};
+    s.Channel = ADC_CHANNEL_3;
+    s.Rank = ADC_REGULAR_RANK_1;
+    /* v71: was ADC_SAMPLETIME_1CYCLE_5 (25ns at the 60MHz ADC clock).  The
+     * sample-and-hold had almost no time to charge through the IF chain's
+     * source impedance, which shows up as level-independent harmonic
+     * distortion -- a tone looks like a square wave on the spectrum display.
+     * 8.5 cycles = 142ns, and 8.5+14.5 = 23 cycles gives 60MHz/23 =
+     * 2.6087MHz, exactly 4x the new TIM3 rate. */
+    s.SamplingTime = ADC_SAMPLETIME_8CYCLES_5;
+    s.SingleDiff = ADC_DIFFERENTIAL_ENDED;
+    s.OffsetNumber = ADC_OFFSET_NONE;
+    s.Offset = 0;
+    if (HAL_ADC_ConfigChannel(&hadc1, &s) != HAL_OK) Error_Handler();
+    /* v71: ADC_CALIB_OFFSET only trims the offset; the ADC's integral
+     * non-linearity (INL) is left uncorrected, which is a level-independent
+     * harmonic-distortion source - a pure tone ends up looking square on the
+     * spectrum display.  OFFSET_LINEARITY runs the linearity calibration too
+     * (a few ms, once at boot). */
+    if (HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET_LINEARITY, ADC_DIFFERENTIAL_ENDED) != HAL_OK) Error_Handler();
+    /* v20.1: ??????? ADC1!
+     * TX ??? ADC1 ???? (TIM2 TRGO ??? DAC1, ? v5/18_ ??????),
+     * ?? ADC1 ??????? TRGO ????? DAC ??/?????
+     * ???(RX 1)? HAL_ADC_Start ??, ???(RX 0)? HAL_ADC_Stop ??? */
+}
+
+/* ========== ADC3: SYNC PCLK/4=30MHz, 1.5cyc ========== */
+static void MX_ADC3_Init(void)
+{
+    __HAL_RCC_ADC3_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = GPIO_PIN_3;
+    g.Mode = GPIO_MODE_ANALOG;
+    g.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOC, &g);
+    hadc3.Instance = ADC3;
+    hadc3.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc3.Init.Resolution = ADC_RESOLUTION_10B;
+    hadc3.Init.ScanConvMode = DISABLE;
+    hadc3.Init.ContinuousConvMode = ENABLE;
+    hadc3.Init.DiscontinuousConvMode = DISABLE;
+    hadc3.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc3.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc3.Init.NbrOfConversion = 1;
+    hadc3.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    hadc3.Init.LowPowerAutoWait = DISABLE;
+    hadc3.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+    hadc3.Init.OversamplingMode = DISABLE;
+    if (HAL_ADC_Init(&hadc3) != HAL_OK) Error_Handler();
+    ADC_ChannelConfTypeDef s = {0};
+    s.Channel = ADC_CHANNEL_1;
+    s.Rank = ADC_REGULAR_RANK_1;
+    s.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+    s.SingleDiff = ADC_SINGLE_ENDED;
+    s.OffsetNumber = ADC_OFFSET_NONE;
+    s.Offset = 0;
+    if (HAL_ADC_ConfigChannel(&hadc3, &s) != HAL_OK) Error_Handler();
+    if (HAL_ADCEx_Calibration_Start(&hadc3, ADC_CALIB_OFFSET_LINEARITY, ADC_SINGLE_ENDED) != HAL_OK) Error_Handler();
+    if (HAL_ADC_Start(&hadc3) != HAL_OK) Error_Handler();
+}
+
+/* ========== GPIO ========== */
+static void MX_GPIO_Init(void)
+{
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = LED_PIN;
+    g.Mode = GPIO_MODE_OUTPUT_PP;
+    g.Pull = GPIO_PULLUP;
+    g.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(LED_PORT, &g);
+    /* v10: PC13 CW ????, ??, ??=???=?? */
+    g.Pin = GPIO_PIN_13;
+    g.Mode = GPIO_MODE_INPUT;
+    g.Pull = GPIO_PULLUP;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &g);
+}
+
+/* ========== SystemClock (APB1 DIV1 -> PCLK1=240MHz, TIM2=240MHz) ========== */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef o = {0};
+    RCC_ClkInitTypeDef c = {0};
+    HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
+    while (!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+    o.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    o.HSEState = RCC_HSE_ON;
+    o.PLL.PLLState = RCC_PLL_ON;
+    o.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+    o.PLL.PLLM = 5;
+    o.PLL.PLLN = 192;
+    o.PLL.PLLP = 2;
+    o.PLL.PLLQ = 2;
+    o.PLL.PLLR = 2;
+    if (HAL_RCC_OscConfig(&o) != HAL_OK) Error_Handler();
+    c.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                 | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2
+                 | RCC_CLOCKTYPE_D3PCLK1 | RCC_CLOCKTYPE_D1PCLK1;
+    c.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    c.SYSCLKDivider = RCC_SYSCLK_DIV1;
+    c.AHBCLKDivider = RCC_HCLK_DIV2;
+    c.APB3CLKDivider = RCC_APB3_DIV2;
+    c.APB1CLKDivider = RCC_APB1_DIV1;
+    c.APB2CLKDivider = RCC_APB2_DIV2;
+    c.APB4CLKDivider = RCC_APB4_DIV2;
+    if (HAL_RCC_ClockConfig(&c, FLASH_LATENCY_4) != HAL_OK) Error_Handler();
+}
+
+void PeriphCommonClock_Config(void)
+{
+    RCC_PeriphCLKInitTypeDef p = {0};
+    p.PeriphClockSelection = RCC_PERIPHCLK_SAI1;
+    p.Sai1ClockSelection = RCC_SAI1CLKSOURCE_PIN;
+    if (HAL_RCCEx_PeriphCLKConfig(&p) != HAL_OK) Error_Handler();
+}
+
+/* Initialize SAI + PCM5102 once, only when entering RX mode */
+static void audio_dac_init_once(void)
+{
+    if (s_audio_dac_inited) return;
+    PeriphCommonClock_Config();
+    MX_SAI1_Init();
+    PCM5102_Init();
+    s_audio_dac_inited = 1;
+}
+
+/* v69: RX chain can be started or stopped independently of the display mode.
+ * Full duplex uses FDX 1 so RX 0 (TX scope view) does not tear down ADC1/PCM. */
+static void rx_chain_start(void)
+{
+    audio_dac_init_once();
+    if (rx_chain_en) {
+        PCM5102_SetDemodMode(1);
+        PCM5102_Play();
+        return;
+    }
+    if (HAL_ADC_Start(&hadc1) != HAL_OK) Error_Handler();
+    rx_chain_en = 1;
+    am_demod_enable(1);
+    PCM5102_SetDemodMode(1);
+    PCM5102_Play();
+}
+
+static void rx_chain_stop(void)
+{
+    if (!rx_chain_en) return;
+    HAL_ADC_Stop(&hadc1);
+    rx_chain_en = 0;
+    am_demod_enable(0);
+    PCM5102_SetDemodMode(0);
+}
+
+/* Configure MPU: ADC DMA 双缓冲区 (0x24000000, 16KB) as Normal non-cacheable.
+   v64: 覆盖 adc_dma_buf/adc_dma_buf2 恰好 16KB, 令 DMA 写内存对 CPU(ISR 环形读/
+   主循环拷贝)恒新鲜, 消除 D-Cache 陈旧行问题; 此后 SCB_InvalidateDCache_by_Addr
+   为无害空操作(保留兼容)。刻意不扩到 32KB: 避免把 0x24004000 音频缓冲与
+   0x24005000 调制运行变量(nfm_inc_run/dc_q16/rx_mode 等)变 non-cacheable。 */
+static void MPU_Config_Audio(void)
+{
+    MPU_Region_InitTypeDef MPU_InitStruct = {0};
+    HAL_MPU_Disable();
+    MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+    MPU_InitStruct.Number = MPU_REGION_NUMBER0;
+    MPU_InitStruct.BaseAddress = 0x24000000;
+    MPU_InitStruct.Size = MPU_REGION_SIZE_16KB;
+    MPU_InitStruct.SubRegionDisable = 0x00;
+    MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL1;
+    MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
+    MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+    MPU_InitStruct.IsShareable = MPU_ACCESS_NOT_SHAREABLE;
+    MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+    MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+    HAL_MPU_ConfigRegion(&MPU_InitStruct);
+    HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+}
+
+void Error_Handler(void)
+{
+    while (1)
+    {
+        HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+        HAL_Delay(50);
+    }
+}
